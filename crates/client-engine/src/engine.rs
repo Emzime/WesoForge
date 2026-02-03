@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::JoinSet;
 
 use crate::api::{
-    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot,
-    WorkerSnapshot, WorkerStage,
+    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot, WorkerSnapshot,
+    WorkerStage,
 };
 use crate::backend::{BackendJobDto, BackendWorkBatch, fetch_work};
 use crate::inflight::InflightStore;
@@ -118,17 +117,17 @@ impl WorkerRuntime {
 
         if let Some(last_at) = self.last_speed_sample_at {
             let dt = now.duration_since(last_at);
-            let (total_iters, total_dt) = if let Some((prev_iters, prev_dt)) = self.prev_speed_interval
-            {
+            let (sum_iters, sum_dt) = if let Some((prev_iters, prev_dt)) = self.prev_speed_interval {
                 (prev_iters.saturating_add(delta), prev_dt + dt)
             } else {
                 (delta, dt)
             };
 
-            if total_dt.as_secs_f64() > 0.0 {
-                self.speed_its_per_sec = (total_iters as f64 / total_dt.as_secs_f64()).round() as u64;
+            if sum_dt.as_secs_f64() > 0.0 {
+                self.speed_its_per_sec = (sum_iters as f64 / sum_dt.as_secs_f64()).round() as u64;
             }
-            self.prev_speed_interval = Some((delta, dt));
+
+            self.prev_speed_interval = Some((sum_iters, sum_dt));
         }
 
         self.last_speed_sample_at = Some(now);
@@ -145,7 +144,9 @@ struct EngineRuntime {
     worker_cmds: Vec<mpsc::Sender<WorkerCommand>>,
     worker_progress: Vec<Arc<std::sync::atomic::AtomicU64>>,
     internal_rx: mpsc::UnboundedReceiver<WorkerInternalEvent>,
-    worker_join: JoinSet<()>,
+
+    // Dedicated OS threads for CPU workers (each runs a current-thread Tokio runtime).
+    worker_threads: Vec<std::thread::JoinHandle<()>>,
 
     pending: VecDeque<WorkJobItem>,
     fetch_task: Option<tokio::task::JoinHandle<anyhow::Result<Vec<WorkJobItem>>>>,
@@ -155,6 +156,9 @@ struct EngineRuntime {
     recent_jobs: VecDeque<JobOutcome>,
     snapshot_tx: watch::Sender<StatusSnapshot>,
     inner: Arc<EngineInner>,
+
+    // Global speed emission
+    last_speed_emitted: u64,
 }
 
 impl EngineRuntime {
@@ -201,21 +205,42 @@ impl EngineRuntime {
         !self.workers.iter().any(|w| w.is_busy())
     }
 
+    fn maybe_warn_gpu_not_ready(&self) {
+        if !self.cfg.gpu_enabled {
+            return;
+        }
+        if self.cfg.gpu_backend == crate::api::GpuBackend::Off {
+            return;
+        }
+
+        // GPU orchestration is prepared (config + plumbing),
+        // but compute/dispatch is implemented in the next patch.
+        self.emit(EngineEvent::Warning {
+            message: "warning: GPU is enabled in config but GPU workers are not wired yet in this build; running CPU-only (CUDA/OpenCL batch worker will be added next).".to_string(),
+        });
+    }
+
     fn maybe_start_fetch(&mut self) {
         if self.inner.should_stop() {
             return;
         }
-        let count = self.idle_count();
-        if count == 0 {
+
+        let cpu_idle = self.idle_count();
+        if cpu_idle == 0 {
             return;
         }
+
         if !self.pending.is_empty() || self.fetch_task.is_some() || self.fetch_backoff.is_some() {
             return;
         }
 
         let http = self.http.clone();
         let backend = self.cfg.backend_url.clone();
-        let count = count;
+
+        // For now, fetch based on CPU needs only.
+        // Next patch: include GPU batch demand in count.
+        let count = cpu_idle;
+
         self.fetch_task = Some(tokio::spawn(async move {
             let count = count.min(u32::MAX as usize) as u32;
             let batch: BackendWorkBatch = fetch_work(&http, &backend, count).await?;
@@ -232,17 +257,19 @@ impl EngineRuntime {
         }));
     }
 
-    async fn assign_jobs(&mut self) -> anyhow::Result<()> {
+    async fn assign_jobs_cpu(&mut self) -> anyhow::Result<()> {
         if self.inner.should_stop() {
             self.pending.clear();
             return Ok(());
         }
 
         let mut snapshot_dirty = false;
+
         for idx in 0..self.workers.len() {
             if !self.workers[idx].is_idle() {
                 continue;
             }
+
             let Some(item) = self.pending.pop_front() else {
                 break;
             };
@@ -258,34 +285,28 @@ impl EngineRuntime {
                 let worker = &mut self.workers[idx];
                 worker.start_job(job_summary.clone());
             }
-            if let Some(a) = self.worker_progress.get(idx) {
-                a.store(0, std::sync::atomic::Ordering::Relaxed);
-            }
+
+            self.worker_progress
+                .get(idx)
+                .map(|p| p.store(0, std::sync::atomic::Ordering::Relaxed));
+
+            let _ = self.worker_cmds[idx]
+                .send(WorkerCommand::Job {
+                    worker_idx: idx,
+                    backend_url: self.cfg.backend_url.clone(),
+                    lease_id: item.lease_id,
+                    lease_expires_at: item.lease_expires_at,
+                    progress_steps: self.cfg.progress_steps,
+                    job: item.job,
+                })
+                .await;
+
             self.emit(EngineEvent::WorkerJobStarted {
                 worker_idx: idx,
                 job: job_summary,
             });
-            self.emit(EngineEvent::WorkerStage {
-                worker_idx: idx,
-                stage: WorkerStage::Computing,
-            });
+
             snapshot_dirty = true;
-
-            let cmd = WorkerCommand::Job {
-                worker_idx: idx,
-                backend_url: self.cfg.backend_url.clone(),
-                lease_id: item.lease_id,
-                lease_expires_at: item.lease_expires_at,
-                job: item.job,
-                progress_steps: self.cfg.progress_steps,
-            };
-
-            self.worker_cmds
-                .get(idx)
-                .ok_or_else(|| anyhow::anyhow!("worker cmd sender missing for worker {idx}"))?
-                .send(cmd)
-                .await
-                .map_err(|_| anyhow::anyhow!("worker {idx} command channel closed"))?;
         }
 
         if snapshot_dirty {
@@ -295,233 +316,177 @@ impl EngineRuntime {
         Ok(())
     }
 
-    async fn handle_fetch_result(
-        &mut self,
-        res: Result<anyhow::Result<Vec<WorkJobItem>>, tokio::task::JoinError>,
-    ) {
-        self.fetch_task = None;
-
-        match res {
-            Ok(Ok(items)) => {
-                if !self.inner.should_stop() {
-                    if let Some(store) = &mut self.inflight {
-                        let mut changed = false;
-                        for item in &items {
-                            changed |= store.insert_job(
-                                item.lease_id.clone(),
-                                item.lease_expires_at,
-                                item.job.clone(),
-                            );
-                        }
-                        if changed {
-                            if let Err(err) = store.persist().await {
-                                self.emit(EngineEvent::Warning {
-                                    message: format!("warning: failed to persist inflight leases: {err:#}"),
-                                });
-                            }
-                        }
-                    }
-                    self.pending.extend(items);
-                }
-                if self.pending.is_empty() {
-                    self.fetch_backoff = Some(Box::pin(tokio::time::sleep(self.cfg.idle_sleep)));
-                }
-            }
-            Ok(Err(err)) => {
-                self.fetch_backoff = Some(Box::pin(tokio::time::sleep(self.cfg.idle_sleep)));
-                self.emit(EngineEvent::Error {
-                    message: format!("work fetch error: {err:#}"),
-                });
-            }
-            Err(err) => {
-                self.fetch_backoff = Some(Box::pin(tokio::time::sleep(self.cfg.idle_sleep)));
-                self.emit(EngineEvent::Error {
-                    message: format!("work fetch task join error: {err:#}"),
-                });
-            }
-        }
-    }
-
-    async fn handle_internal_event(&mut self, ev: WorkerInternalEvent) {
-        match ev {
-            WorkerInternalEvent::StageChanged { worker_idx, stage } => {
-                if let Some(worker) = self.workers.get_mut(worker_idx) {
-                    worker.set_stage(stage);
-                }
-                self.emit(EngineEvent::WorkerStage { worker_idx, stage });
-                self.push_snapshot();
-            }
-            WorkerInternalEvent::Finished { outcome } => {
-                let worker_idx = outcome.worker_idx;
-                if let Some(worker) = self.workers.get_mut(worker_idx) {
-                    worker.finish_job();
-                }
-                if let Some(a) = self.worker_progress.get(worker_idx) {
-                    a.store(0, Ordering::Relaxed);
-                }
-
-                self.recent_jobs.push_back(outcome.clone());
-                while self.recent_jobs.len() > self.cfg.recent_jobs_max.max(1) {
-                    self.recent_jobs.pop_front();
-                }
-
-                if outcome.drop_inflight || (outcome.error.is_none() && outcome.submit_reason.is_some()) {
-                    if let Some(store) = &mut self.inflight {
-                        if store.remove_job(outcome.job.job_id) {
-                            if let Err(err) = store.persist().await {
-                                self.emit(EngineEvent::Warning {
-                                    message: format!("warning: failed to persist inflight leases: {err:#}"),
-                                });
-                            }
-                        }
-                    }
-                }
-
-                self.emit(EngineEvent::JobFinished { outcome });
-                self.push_snapshot();
-            }
-            WorkerInternalEvent::Warning { message } => {
-                self.emit(EngineEvent::Warning { message });
-            }
-            WorkerInternalEvent::Error { message } => {
-                self.emit(EngineEvent::Error { message });
-            }
-        }
-    }
-
-    fn sample_progress(&mut self) {
-        let mut snapshot_dirty = false;
-        for idx in 0..self.workers.len() {
-            if self.workers[idx].is_idle() {
-                continue;
-            }
-            let Some(progress) = self.worker_progress.get(idx) else {
-                continue;
-            };
-            let iters_done = progress.load(std::sync::atomic::Ordering::Relaxed);
-
-            let (iters_done, iters_total, iters_per_sec) = {
-                let worker = &mut self.workers[idx];
-                let Some(iters_done) = worker.apply_progress(iters_done) else {
-                    continue;
-                };
-                if iters_done == worker.last_emitted_iters_done {
-                    continue;
-                }
-                worker.last_emitted_iters_done = iters_done;
-                (iters_done, worker.iters_total, worker.speed_its_per_sec)
-            };
-
-            self.emit(EngineEvent::WorkerProgress {
-                worker_idx: idx,
-                iters_done,
-                iters_total,
-                iters_per_sec,
-            });
-            snapshot_dirty = true;
-        }
-
-        if snapshot_dirty {
-            self.push_snapshot();
-        }
-    }
-
     async fn shutdown_workers(&mut self) {
         for tx in &self.worker_cmds {
             let _ = tx.send(WorkerCommand::Stop).await;
         }
-        while let Some(res) = self.worker_join.join_next().await {
-            if res.is_err() {
-                // Ignore.
+
+        let mut handles = Vec::new();
+        std::mem::swap(&mut handles, &mut self.worker_threads);
+
+        // Join threads without blocking the async reactor.
+        let join_res = tokio::task::spawn_blocking(move || {
+            for h in handles {
+                let _ = h.join();
             }
+        })
+        .await;
+
+        if let Err(err) = join_res {
+            self.emit(EngineEvent::Warning {
+                message: format!("warning: join cpu worker threads task failed: {err:#}"),
+            });
+        }
+    }
+
+    fn update_speeds_and_emit(&mut self) {
+        let mut total_speed: u64 = 0;
+        let mut busy: usize = 0;
+
+        for (idx, w) in self.workers.iter_mut().enumerate() {
+            if w.is_busy() {
+                busy += 1;
+            }
+
+            if w.iters_total == 0 {
+                continue;
+            }
+
+            let iters_done = self
+                .worker_progress
+                .get(idx)
+                .map(|p| p.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0);
+
+            if let Some(iters_done) = w.apply_progress(iters_done) {
+                if iters_done != w.last_emitted_iters_done {
+                    w.last_emitted_iters_done = iters_done;
+                    self.emit(EngineEvent::WorkerProgress {
+                        worker_idx: idx,
+                        iters_done,
+                        iters_total: w.iters_total,
+                        iters_per_sec: w.speed_its_per_sec,
+                    });
+                }
+            }
+
+            total_speed = total_speed.saturating_add(w.speed_its_per_sec);
+        }
+
+        if total_speed != self.last_speed_emitted {
+            self.last_speed_emitted = total_speed;
+            self.emit(EngineEvent::Speed {
+                iters_per_sec: total_speed,
+                busy,
+                total: self.workers.len(),
+            });
         }
     }
 
     async fn run(mut self) -> anyhow::Result<()> {
         self.emit(EngineEvent::Started);
-        self.push_snapshot();
 
-        let mut progress_tick = tokio::time::interval(self.cfg.progress_tick);
-        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Warn once if GPU enabled but not wired yet.
+        self.maybe_warn_gpu_not_ready();
 
+        let mut tick = tokio::time::interval(self.cfg.progress_tick);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut last_snapshot_at = Instant::now();
         let mut result: anyhow::Result<()> = Ok(());
 
         loop {
             if self.inner.should_stop() && self.all_idle() {
-                if let Some(task) = self.fetch_task.take() {
-                    task.abort();
-                }
-                self.fetch_backoff = None;
-                self.pending.clear();
                 break;
             }
 
-            if let Err(err) = self.assign_jobs().await {
-                result = Err(err);
-                break;
-            }
             self.maybe_start_fetch();
 
-            let loop_result: anyhow::Result<()> = tokio::select! {
-                _ = progress_tick.tick() => {
-                    self.sample_progress();
-                    Ok(())
-                }
-                _ = self.inner.notify.notified() => Ok(()),
-                ev_opt = self.internal_rx.recv() => {
-                    if let Some(ev) = ev_opt {
-                        self.handle_internal_event(ev).await;
+            tokio::select! {
+                _ = self.inner.notify.notified() => {}
+                _ = tick.tick() => {}
+                Some(ev) = self.internal_rx.recv() => {
+                    match ev {
+                        WorkerInternalEvent::StageChanged { worker_idx, stage } => {
+                            if let Some(w) = self.workers.get_mut(worker_idx) {
+                                w.set_stage(stage);
+                            }
+                            self.push_snapshot();
+                            self.emit(EngineEvent::WorkerStage { worker_idx, stage });
+                        }
+                        WorkerInternalEvent::Finished { outcome } => {
+                            let worker_idx = outcome.worker_idx;
+                            if let Some(w) = self.workers.get_mut(worker_idx) {
+                                w.finish_job();
+                            }
+                            self.recent_jobs.push_back(outcome.clone());
+                            while self.recent_jobs.len() > self.cfg.recent_jobs_max {
+                                self.recent_jobs.pop_front();
+                            }
+                            self.push_snapshot();
+                            self.emit(EngineEvent::JobFinished { outcome });
+                        }
+                        WorkerInternalEvent::Warning { message } => {
+                            self.emit(EngineEvent::Warning { message });
+                        }
+                        WorkerInternalEvent::Error { message } => {
+                            self.emit(EngineEvent::Error { message });
+                        }
                     }
-                    Ok(())
                 }
-                res = async {
-                    match self.fetch_task.as_mut() {
-                        Some(task) => task.await,
-                        None => std::future::pending::<Result<anyhow::Result<Vec<WorkJobItem>>, tokio::task::JoinError>>().await,
+                Some(res) = async { self.fetch_task.as_mut().map(|h| h.await).transpose() } => {
+                    self.fetch_task = None;
+                    match res {
+                        Ok(Ok(items)) => {
+                            for item in items {
+                                self.pending.push_back(item);
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            self.fetch_backoff = Some(Box::pin(tokio::time::sleep(Duration::from_secs(5))));
+                            self.emit(EngineEvent::Warning {
+                                message: format!("warning: fetch work failed: {err:#}"),
+                            });
+                        }
+                        Err(err) => {
+                            self.fetch_backoff = Some(Box::pin(tokio::time::sleep(Duration::from_secs(5))));
+                            self.emit(EngineEvent::Warning {
+                                message: format!("warning: fetch join failed: {err:#}"),
+                            });
+                        }
                     }
-                } => {
-                    self.handle_fetch_result(res).await;
-                    Ok(())
                 }
                 _ = async {
-                    match self.fetch_backoff.as_mut() {
-                        Some(sleep) => sleep.as_mut().await,
-                        None => std::future::pending::<()>().await,
+                    if let Some(s) = self.fetch_backoff.as_mut() {
+                        s.as_mut().await;
                     }
-                } => {
+                }, if self.fetch_backoff.is_some() => {
                     self.fetch_backoff = None;
-                    Ok(())
                 }
-                res = self.worker_join.join_next() => {
-                    match res {
-                        Some(Ok(())) => Err(anyhow::anyhow!("worker task exited unexpectedly")),
-                        Some(Err(err)) => Err(anyhow::anyhow!("worker task join error: {err:#}")),
-                        None => Err(anyhow::anyhow!("worker join set empty unexpectedly")),
-                    }
-                }
-            };
+                _ = tokio::time::sleep(self.cfg.idle_sleep), if self.pending.is_empty() => {}
+            }
 
-            if let Err(err) = loop_result {
-                result = Err(err);
+            if let Err(err) = self.assign_jobs_cpu().await {
+                let message = format!("assign jobs failed: {err:#}");
+                self.emit(EngineEvent::Error { message: message.clone() });
+                result = Err(anyhow::anyhow!("{message}"));
                 break;
+            }
+
+            let now = Instant::now();
+            if now.duration_since(last_snapshot_at) >= Duration::from_secs(1) {
+                last_snapshot_at = now;
+                self.update_speeds_and_emit();
+                self.push_snapshot();
             }
         }
 
-        if let Err(err) = &result {
-            self.emit(EngineEvent::Error {
-                message: format!("engine error: {err:#}"),
-            });
-        }
-
-        if let Some(task) = self.fetch_task.take() {
-            task.abort();
-        }
-        self.fetch_backoff = None;
         self.pending.clear();
-
         self.shutdown_workers().await;
+
         self.emit(EngineEvent::Stopped);
         self.push_snapshot();
+
         result
     }
 }
@@ -566,36 +531,22 @@ async fn run_engine(
         cfg.recent_jobs_max = EngineConfig::DEFAULT_RECENT_JOBS_MAX;
     }
 
+    // chiavdf fast wrapper uses a process-wide memory budget.
     bbr_client_chiavdf_fast::set_bucket_memory_budget_bytes(cfg.mem_budget_bytes);
 
-    let http = match reqwest::Client::builder()
+    let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
-        .build()
-    {
-        Ok(http) => http,
-        Err(err) => {
-            let message = format!("build http client: {err:#}");
-            let _ = inner
-                .event_tx
-                .send(EngineEvent::Error { message: message.clone() });
-            let _ = inner.event_tx.send(EngineEvent::Stopped);
-            let _ = snapshot_tx.send(StatusSnapshot {
-                stop_requested: inner.should_stop(),
-                workers: Vec::new(),
-                recent_jobs: Vec::new(),
-            });
-            return Err(anyhow::anyhow!("{message}"));
-        }
-    };
+        .build()?;
 
-    let submitter = Arc::new(tokio::sync::RwLock::new(cfg.submitter.clone()));
-    let warned_invalid_reward_address = Arc::new(AtomicBool::new(false));
-
+    // Spawn CPU worker threads (each owns its own current-thread Tokio runtime).
     let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
 
     let mut worker_cmds = Vec::with_capacity(cfg.parallel);
     let mut worker_progress = Vec::with_capacity(cfg.parallel);
-    let mut worker_join = JoinSet::new();
+    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(cfg.parallel);
+
+    let submitter = Arc::new(tokio::sync::RwLock::new(cfg.submitter.clone()));
+    let warned_invalid_reward_address = Arc::new(AtomicBool::new(false));
 
     for worker_idx in 0..cfg.parallel {
         let (tx, rx) = mpsc::channel::<WorkerCommand>(1);
@@ -604,28 +555,59 @@ async fn run_engine(
         let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
         worker_progress.push(progress.clone());
 
+        let internal_tx = internal_tx.clone();
         let http = http.clone();
         let submitter = submitter.clone();
         let warned = warned_invalid_reward_address.clone();
-        let internal_tx = internal_tx.clone();
-        let progress = progress.clone();
 
-        worker_join.spawn(async move {
-            crate::worker::run_worker_task(
-                worker_idx,
-                rx,
-                internal_tx,
-                progress,
-                http,
-                submitter,
-                warned,
-            )
-            .await;
-        });
+        // Dedicated OS thread to make CPU affinity deterministic.
+        let handle = std::thread::Builder::new()
+            .name(format!("bbr-cpu-worker-{}", worker_idx + 1))
+            .spawn(move || {
+                // Each worker thread runs its own single-threaded Tokio runtime.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+
+                let rt = match rt {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = internal_tx.send(WorkerInternalEvent::Error {
+                            message: format!(
+                                "error: failed to build worker tokio runtime (worker {}): {err:#}",
+                                worker_idx + 1
+                            ),
+                        });
+                        return;
+                    }
+                };
+
+                rt.block_on(async move {
+                    crate::worker::run_worker_task(
+                        worker_idx,
+                        rx,
+                        internal_tx,
+                        progress,
+                        http,
+                        submitter,
+                        warned,
+                    )
+                    .await;
+                });
+            });
+
+        match handle {
+            Ok(h) => worker_threads.push(h),
+            Err(err) => {
+                let _ = inner.event_tx.send(EngineEvent::Error {
+                    message: format!("error: failed to spawn cpu worker thread {}: {err:#}", worker_idx + 1),
+                });
+                return Err(anyhow::anyhow!("failed to spawn cpu worker thread"));
+            }
+        }
     }
 
-    let workers = (0..cfg.parallel).map(|_| WorkerRuntime::new()).collect();
-
+    // Load inflight leases (resume).
     let mut inflight = match InflightStore::load() {
         Ok(Some(store)) => Some(store),
         Ok(None) => None,
@@ -636,6 +618,7 @@ async fn run_engine(
         }
     };
 
+    // Drop expired inflight leases.
     if let Some(store) = inflight.as_mut() {
         let now = Utc::now().timestamp();
         let expired_job_ids: Vec<u64> = store
@@ -645,7 +628,6 @@ async fn run_engine(
             .collect();
 
         if !expired_job_ids.is_empty() {
-            let expired_count = expired_job_ids.len();
             for job_id in expired_job_ids {
                 store.remove_job(job_id);
             }
@@ -654,16 +636,11 @@ async fn run_engine(
                 let _ = inner.event_tx.send(EngineEvent::Warning {
                     message: format!("warning: failed to persist expired inflight lease cleanup: {err:#}"),
                 });
-            } else {
-                let _ = inner.event_tx.send(EngineEvent::Warning {
-                    message: format!(
-                        "Discarded {expired_count} expired inflight lease(s) from previous run."
-                    ),
-                });
             }
         }
     }
 
+    // Seed pending from inflight.
     let mut pending = VecDeque::new();
     if let Some(store) = inflight.as_ref() {
         for entry in store.entries() {
@@ -674,13 +651,16 @@ async fn run_engine(
             });
         }
         if !pending.is_empty() {
-            let message = format!(
-                "Loaded {} inflight lease(s) from previous run; processing them before leasing new work.",
-                pending.len()
-            );
-            let _ = inner.event_tx.send(EngineEvent::Warning { message });
+            let _ = inner.event_tx.send(EngineEvent::Warning {
+                message: format!(
+                    "Loaded {} inflight lease(s) from previous run; processing them before leasing new work.",
+                    pending.len()
+                ),
+            });
         }
     }
+
+    let workers = (0..cfg.parallel).map(|_| WorkerRuntime::new()).collect();
 
     let runtime = EngineRuntime {
         http,
@@ -689,7 +669,7 @@ async fn run_engine(
         worker_cmds,
         worker_progress,
         internal_rx,
-        worker_join,
+        worker_threads,
         pending,
         fetch_task: None,
         fetch_backoff: None,
@@ -697,6 +677,7 @@ async fn run_engine(
         recent_jobs: VecDeque::new(),
         snapshot_tx,
         inner,
+        last_speed_emitted: 0,
     };
 
     runtime.push_snapshot();

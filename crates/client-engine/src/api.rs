@@ -6,13 +6,28 @@ use bbr_client_core::submitter::SubmitterConfig;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
+/// GPU backend selection (CUDA/OpenCL).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GpuBackend {
+    /// Try CUDA first (NVIDIA), then OpenCL (AMD/NVIDIA), else disable.
+    Auto,
+    /// Force CUDA (NVIDIA only). If unavailable, GPU will be effectively disabled.
+    Cuda,
+    /// Force OpenCL (AMD/NVIDIA). If unavailable, GPU will be effectively disabled.
+    Opencl,
+    /// Disable GPU completely.
+    Off,
+}
+
 /// Configuration for the in-process engine.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Backend base URL (e.g. `http://127.0.0.1:8080`).
     pub backend_url: Url,
 
-    /// Number of proof workers to run concurrently.
+    /// Number of proof workers to run concurrently (CPU workers).
+    ///
+    /// GPU workers are configured separately and run concurrently.
     pub parallel: usize,
 
     /// Memory budget (bytes) for the native streaming prover parameter tuner.
@@ -38,6 +53,50 @@ pub struct EngineConfig {
 
     /// Maximum number of completed jobs retained in the snapshot.
     pub recent_jobs_max: usize,
+
+    // -----------------------------
+    // CPU scheduling / pinning policy
+    // -----------------------------
+
+    /// Enable CPU thread pinning (best effort on non-Windows/Linux).
+    pub cpu_pin_threads: bool,
+
+    /// Reserve logical core 0 for the OS (never schedule CPU workers on core 0).
+    pub cpu_reserve_core0: bool,
+
+    /// Assign CPU workers on cores in reverse order (last -> ... -> 1).
+    pub cpu_reverse_cores: bool,
+
+    // -----------------------------
+    // GPU orchestration (prepared for GUI)
+    // -----------------------------
+
+    /// Enable GPU acceleration. If false, CPU-only mode.
+    pub gpu_enabled: bool,
+
+    /// Selected GPU backend strategy.
+    pub gpu_backend: GpuBackend,
+
+    /// Use at most N GPUs out of those installed/detected.
+    pub gpu_max_devices: Option<usize>,
+
+    /// Optional allowlist (indexes like "0","1" or name substrings like "4090","7900").
+    pub gpu_device_allowlist: Vec<String>,
+
+    /// Max number of in-flight batches per GPU device (pipelining).
+    pub gpu_inflight_batches: usize,
+
+    /// Minimum batch size per GPU launch.
+    pub gpu_batch_min: usize,
+
+    /// Maximum batch size per GPU launch (auto-tuner clamps to this).
+    pub gpu_batch_max: usize,
+
+    /// Batch builder timeout in milliseconds (launch when >= min batch even if not full).
+    pub gpu_batch_timeout_ms: u32,
+
+    /// VRAM utilization ratio for auto batch sizing.
+    pub gpu_vram_ratio: f32,
 }
 
 impl EngineConfig {
@@ -157,6 +216,15 @@ pub enum EngineEvent {
         /// New stage.
         stage: WorkerStage,
     },
+    /// Global speed update (sum of all workers), used by CLI/TUI.
+    Speed {
+        /// Total speed (iterations/second).
+        iters_per_sec: u64,
+        /// Number of workers currently busy.
+        busy: usize,
+        /// Total number of workers.
+        total: usize,
+    },
     /// Worker completed a job (success or failure).
     JobFinished {
         /// Job outcome.
@@ -196,29 +264,4 @@ pub struct EngineHandle {
 /// Start a new in-process engine instance.
 pub fn start_engine(config: EngineConfig) -> EngineHandle {
     crate::engine::start_engine(config)
-}
-
-impl EngineHandle {
-    /// Subscribe to the engine event stream.
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EngineEvent> {
-        self.inner.event_tx.subscribe()
-    }
-
-    /// Get the latest engine snapshot.
-    pub fn snapshot(&self) -> StatusSnapshot {
-        self.inner.snapshot_rx.borrow().clone()
-    }
-
-    /// Request a graceful shutdown (finish in-flight work, stop leasing new jobs).
-    pub fn request_stop(&self) {
-        self.inner.request_stop();
-    }
-
-    /// Wait for the engine to stop, returning the engine task result.
-    pub async fn wait(self) -> anyhow::Result<()> {
-        match self.join.await {
-            Ok(res) => res,
-            Err(err) => Err(anyhow::anyhow!("engine task join error: {err}")),
-        }
-    }
 }

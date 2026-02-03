@@ -11,14 +11,14 @@ use std::io::IsTerminal;
 use std::time::Duration;
 
 use bbr_client_chiavdf_fast::{set_bucket_memory_budget_bytes, set_enable_streaming_stats};
-use bbr_client_core::submitter::{SubmitterConfig, ensure_submitter_config};
-use bbr_client_engine::{EngineConfig, EngineEvent, start_engine};
+use bbr_client_core::submitter::{ensure_submitter_config, SubmitterConfig};
+use bbr_client_engine::{start_engine, EngineConfig, EngineEvent, GpuBackend};
 
 use crate::bench::run_benchmark;
-use crate::cli::Cli;
+use crate::cli::{Cli, GpuBackendArg};
 use crate::constants::PROGRESS_BAR_STEPS;
 use crate::format::{format_job_done_line, humanize_submit_reason};
-use crate::shutdown::{ShutdownController, ShutdownEvent, spawn_ctrl_c_handler};
+use crate::shutdown::{spawn_ctrl_c_handler, ShutdownController, ShutdownEvent};
 use crate::terminal::TuiTerminal;
 use crate::ui::Ui;
 
@@ -75,6 +75,14 @@ async fn main() -> anyhow::Result<()> {
     let warn_tui_too_many_workers = tui_enabled && parallel > 32;
     let progress_steps = if tui_enabled { PROGRESS_BAR_STEPS } else { 0 };
 
+    // Map CLI GPU backend enum to engine enum.
+    let gpu_backend = match cli.gpu_backend {
+        GpuBackendArg::Auto => GpuBackend::Auto,
+        GpuBackendArg::Cuda => GpuBackend::Cuda,
+        GpuBackendArg::Opencl => GpuBackend::Opencl,
+        GpuBackendArg::Off => GpuBackend::Off,
+    };
+
     let engine = start_engine(EngineConfig {
         backend_url: cli.backend_url.clone(),
         parallel,
@@ -84,6 +92,22 @@ async fn main() -> anyhow::Result<()> {
         progress_steps,
         progress_tick: Duration::ZERO,
         recent_jobs_max: 0,
+
+        // CPU core pinning policy.
+        cpu_pin_threads: cli.cpu_pin_threads,
+        cpu_reserve_core0: cli.cpu_reserve_core0,
+        cpu_reverse_cores: cli.cpu_reverse_cores,
+
+        // GPU orchestration (prepared for GUI).
+        gpu_enabled: cli.gpu_enabled,
+        gpu_backend,
+        gpu_max_devices: cli.gpu_max_devices.map(|v| v as usize),
+        gpu_device_allowlist: cli.gpu_device_allowlist.clone().unwrap_or_default(),
+        gpu_inflight_batches: cli.gpu_inflight_batches as usize,
+        gpu_batch_min: cli.gpu_batch_min as usize,
+        gpu_batch_max: cli.gpu_batch_max as usize,
+        gpu_batch_timeout_ms: cli.gpu_batch_timeout_ms,
+        gpu_vram_ratio: cli.gpu_vram_ratio,
     });
 
     let mut events = engine.subscribe();
@@ -226,21 +250,23 @@ async fn main() -> anyhow::Result<()> {
                             eprintln!("{message}");
                         }
                     }
-                    EngineEvent::Stopped => break,
+                    EngineEvent::Speed { iters_per_sec, busy, .. } => {
+                        if tui_enabled {
+                            if let Some(ui) = &ui {
+                                ui.tick_global(iters_per_sec, busy, parallel);
+                            }
+                        }
+                    }
+                    EngineEvent::Stopped => {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    if let Some(ui) = &ui {
-        ui.freeze();
-    }
-
     if immediate_exit {
-        drop(tui_terminal);
-        std::process::exit(130);
+        std::process::exit(2);
     }
-
-    engine.wait().await?;
     Ok(())
 }

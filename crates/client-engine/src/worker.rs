@@ -13,6 +13,7 @@ use bbr_client_core::submitter::SubmitterConfig;
 
 use crate::api::{JobOutcome, JobSummary, WorkerStage};
 use crate::backend::{BackendError, BackendJobDto, SubmitResponse, submit_job};
+use crate::cpu_affinity::{CpuPinPolicy, pin_current_thread};
 
 const DISCRIMINANT_BITS: usize = 1024;
 
@@ -37,6 +38,22 @@ pub(crate) enum WorkerCommand {
         progress_steps: u64,
         job: BackendJobDto,
     },
+    /// GPU batch execution command.
+    ///
+    /// Notes:
+    /// - `worker_idx` should be unique across CPU + GPU workers (engine decides the numbering).
+    /// - The current implementation computes the batch sequentially on CPU as a functional stub.
+    ///   The CUDA/OpenCL backends will plug into this command in the next step.
+    GpuBatch {
+        worker_idx: usize,
+        backend_url: Url,
+        lease_id: String,
+        lease_expires_at: i64,
+        progress_steps: u64,
+        jobs: Vec<BackendJobDto>,
+        /// Human-readable device label (e.g. "CUDA:0 RTX 4090").
+        device_label: String,
+    },
     Stop,
 }
 
@@ -48,7 +65,7 @@ pub(crate) enum WorkerInternalEvent {
 }
 
 pub(crate) async fn run_worker_task(
-    _worker_idx: usize,
+    worker_idx: usize,
     mut rx: mpsc::Receiver<WorkerCommand>,
     internal_tx: mpsc::UnboundedSender<WorkerInternalEvent>,
     progress: Arc<AtomicU64>,
@@ -56,6 +73,33 @@ pub(crate) async fn run_worker_task(
     submitter: Arc<tokio::sync::RwLock<SubmitterConfig>>,
     warned_invalid_reward_address: Arc<AtomicBool>,
 ) {
+    // Best-effort CPU pinning.
+    // This will be fully effective once the engine runs 1 dedicated OS thread per CPU worker.
+    // On Windows/Linux, this pins the current thread. On macOS, it's a no-op.
+    match pin_current_thread(worker_idx, CpuPinPolicy::default()) {
+        Ok(Some(core_id)) => {
+            let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                message: format!(
+                    "info: cpu worker {} pinned to core {} (core 0 reserved, reverse order)",
+                    worker_idx + 1,
+                    core_id
+                ),
+            });
+        }
+        Ok(None) => {
+            // No warning needed: could be unsupported OS or no core list available.
+        }
+        Err(err) => {
+            let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                message: format!(
+                    "warning: cpu worker {} pinning failed: {}",
+                    worker_idx + 1,
+                    err
+                ),
+            });
+        }
+    }
+
     while let Some(cmd) = rx.recv().await {
         match cmd {
             WorkerCommand::Stop => break,
@@ -83,8 +127,91 @@ pub(crate) async fn run_worker_task(
                 .await;
                 let _ = internal_tx.send(WorkerInternalEvent::Finished { outcome });
             }
+            WorkerCommand::GpuBatch {
+                worker_idx,
+                backend_url,
+                lease_id,
+                lease_expires_at,
+                progress_steps,
+                jobs,
+                device_label,
+            } => {
+                let outcomes = run_gpu_batch(
+                    worker_idx,
+                    &device_label,
+                    &internal_tx,
+                    progress.clone(),
+                    &http,
+                    &submitter,
+                    warned_invalid_reward_address.clone(),
+                    backend_url,
+                    lease_id,
+                    lease_expires_at,
+                    progress_steps,
+                    jobs,
+                )
+                .await;
+
+                for outcome in outcomes {
+                    let _ = internal_tx.send(WorkerInternalEvent::Finished { outcome });
+                }
+            }
         }
     }
+}
+
+async fn run_gpu_batch(
+    worker_idx: usize,
+    device_label: &str,
+    internal_tx: &mpsc::UnboundedSender<WorkerInternalEvent>,
+    progress: Arc<AtomicU64>,
+    http: &reqwest::Client,
+    submitter: &tokio::sync::RwLock<SubmitterConfig>,
+    warned_invalid_reward_address: Arc<AtomicBool>,
+    backend_url: Url,
+    lease_id: String,
+    lease_expires_at: i64,
+    progress_steps: u64,
+    jobs: Vec<BackendJobDto>,
+) -> Vec<JobOutcome> {
+    // This is a functional stub: it executes the batch sequentially on CPU using the
+    // existing chiavdf path, but keeps the orchestration "batch -> submit" semantics.
+    // The CUDA/OpenCL backends will plug into this function next.
+
+    let _ = internal_tx.send(WorkerInternalEvent::Warning {
+        message: format!(
+            "info: gpu worker {} received batch={} on {} (CPU-stub execution)",
+            worker_idx + 1,
+            jobs.len(),
+            device_label
+        ),
+    });
+
+    let mut outcomes = Vec::with_capacity(jobs.len());
+
+    for job in jobs {
+        // Reset progress per job to keep UI consistent.
+        progress.store(0, Ordering::Relaxed);
+
+        let outcome = run_job(
+            worker_idx,
+            internal_tx,
+            progress.clone(),
+            http,
+            submitter,
+            warned_invalid_reward_address.clone(),
+            backend_url.clone(),
+            lease_id.clone(),
+            lease_expires_at,
+            progress_steps,
+            job,
+        )
+        .await;
+
+        outcomes.push(outcome);
+    }
+
+    outcomes
 }
 
 async fn run_job(
@@ -354,7 +481,8 @@ async fn submit_witness(
 ) -> Result<SubmitResponse, SubmitFailure> {
     let mut last_submit_err: Option<String> = None;
     let mut attempts: u32 = 0;
-    let mut last_log_at = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
+    let mut last_log_at =
+        Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
 
     loop {
         let now = Utc::now().timestamp();

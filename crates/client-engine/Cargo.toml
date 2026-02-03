@@ -15,3 +15,7 @@ tokio = { workspace = true }
 
 bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
 bbr-client-core = { path = "../client-core" }
+
+# CPU thread pinning helpers (Windows/Linux). macOS falls back to no pinning.
+core_affinity = "0.8"
+cfg-if = "1"
