@@ -67,6 +67,17 @@ pub struct EngineConfig {
     /// Assign CPU workers on cores in reverse order (last -> ... -> 1).
     pub cpu_reverse_cores: bool,
 
+    /// Optional CPU core allowlist (e.g. "2,3,6,7,10-15").
+    ///
+    /// When set, only those logical cores are used for CPU workers.
+    /// Note: this has priority over `cpu_reserve_core0`.
+    pub cpu_core_allowlist: Option<String>,
+
+    /// Optional CPU core blocklist (e.g. "0,1").
+    ///
+    /// When set, those logical cores are excluded (even if present in allowlist).
+    pub cpu_core_blocklist: Option<String>,
+
     // -----------------------------
     // GPU orchestration (prepared for GUI)
     // -----------------------------
