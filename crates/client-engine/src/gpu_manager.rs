@@ -2,16 +2,16 @@
 
 use crate::gpu::{
     allowlist_matches, auto_batch_size_for_device, estimate_bytes_per_job, GpuBatchConfig,
-    GpuDeviceInfo, GpuPlan, GpuPlannedDevice, GpuSelectConfig, GpuBackendKind,
+    GpuDeviceInfo, GpuPlan, GpuPlannedDevice, GpuSelectConfig,
 };
 
 /// Enumerate devices available for CUDA and/or OpenCL.
 ///
 /// Current implementation:
-/// - returns "stub" devices when GPU is enabled, to validate orchestration end-to-end.
-/// - once cuda_backend/opencl_backend are implemented, this should call into them.
+/// - CUDA uses `nvidia-smi` when available (works on Windows/Linux with NVIDIA drivers).
+/// - OpenCL is still a stub (will be implemented later).
 ///
-/// This keeps the engine code stable while GPU compute is being implemented.
+/// This keeps engine orchestration stable while the actual compute backends evolve.
 pub fn enumerate_devices(select: &GpuSelectConfig) -> Vec<GpuDeviceInfo> {
     if !select.enabled {
         return Vec::new();
@@ -19,35 +19,12 @@ pub fn enumerate_devices(select: &GpuSelectConfig) -> Vec<GpuDeviceInfo> {
 
     let mut devices: Vec<GpuDeviceInfo> = Vec::new();
 
-    // TODO: Replace stubs with real detection:
-    // - CUDA: query device list (NVIDIA)
-    // - OpenCL: query platforms/devices (AMD/NVIDIA)
-    //
-    // For now we expose predictable "virtual" devices so multi-GPU orchestration,
-    // max_devices, allowlist, and batch sizing can be tested.
-
-    // If allow_cuda is true, provide a CUDA stub.
     if select.allow_cuda {
-        devices.push(GpuDeviceInfo {
-            backend: GpuBackendKind::Cuda,
-            index: 0,
-            name: "CUDA-Stub".to_string(),
-            vendor: "NVIDIA".to_string(),
-            vram_total_bytes: 0,
-            vram_free_bytes: 0,
-        });
+        devices.extend(crate::cuda_backend::enumerate_cuda_devices());
     }
 
-    // If allow_opencl is true, provide an OpenCL stub.
     if select.allow_opencl {
-        devices.push(GpuDeviceInfo {
-            backend: GpuBackendKind::Opencl,
-            index: 0,
-            name: "OpenCL-Stub".to_string(),
-            vendor: "AMD".to_string(),
-            vram_total_bytes: 0,
-            vram_free_bytes: 0,
-        });
+        devices.extend(crate::opencl_backend::enumerate_opencl_devices());
     }
 
     // Apply allowlist if present.
@@ -60,7 +37,7 @@ pub fn enumerate_devices(select: &GpuSelectConfig) -> Vec<GpuDeviceInfo> {
 
     // Apply max_devices cap.
     if let Some(max) = select.max_devices {
-        devices.truncate(max.max(0));
+        devices.truncate(max);
     }
 
     devices
