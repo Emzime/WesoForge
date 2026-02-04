@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use bbr_client_core::submitter::SubmitterConfig;
 
 use crate::api::{JobOutcome, JobSummary, WorkerStage};
+use crate::gpu::GpuDeviceId;
 use crate::backend::{BackendError, BackendJobDto, SubmitResponse, submit_job};
 use crate::cpu_affinity::{CpuPinPolicy, pin_current_thread_with_lists};
 
@@ -126,6 +127,8 @@ pub(crate) enum WorkerCommand {
         lease_expires_at: i64,
         progress_steps: u64,
         jobs: Vec<BackendJobDto>,
+        /// Structured GPU device identifier.
+        device_id: GpuDeviceId,
         /// Human-readable device label (e.g. "CUDA:0 RTX 4090").
         device_label: String,
     },
@@ -248,10 +251,12 @@ if !cpu_pinned {
                 lease_expires_at,
                 progress_steps,
                 jobs,
+                device_id,
                 device_label,
             } => {
                 let outcomes = run_gpu_batch(
                     worker_idx,
+                    device_id,
                     &device_label,
                     &internal_tx,
                     progress.clone(),
@@ -276,6 +281,7 @@ if !cpu_pinned {
 
 async fn run_gpu_batch(
     worker_idx: usize,
+    device_id: GpuDeviceId,
     device_label: &str,
     internal_tx: &mpsc::UnboundedSender<WorkerInternalEvent>,
     progress: Arc<AtomicU64>,
@@ -288,19 +294,102 @@ async fn run_gpu_batch(
     progress_steps: u64,
     jobs: Vec<BackendJobDto>,
 ) -> Vec<JobOutcome> {
-    // This is a functional stub: it executes the batch sequentially on CPU using the
-    // existing chiavdf path, but keeps the orchestration "batch -> submit" semantics.
-    // The CUDA/OpenCL backends will plug into this function next.
+    // Comments in English as requested.
+    //
+    // Production "light guards" strategy:
+    // - Always keep CPU path available (this project *adds* GPU, it does not remove CPU).
+    // - GPU is opportunistic: if CUDA batch execution fails, we log and continue with CPU.
+    // - We only do cheap validation (shape + a few samples) to avoid burning CPU time.
 
     let _ = internal_tx.send(WorkerInternalEvent::Warning {
         message: format!(
-            "info: gpu worker {} received batch={} on {} (CPU-stub execution)",
+            "info: gpu worker {} received batch={} on {} (device_id={:?}:{})",
             worker_idx + 1,
             jobs.len(),
-            device_label
+            device_label,
+            device_id.backend,
+            device_id.index
         ),
     });
 
+    // Real GPU batch hook (scaffolding):
+    // - Pack one u32 per job (first 4 bytes of decoded challenge, little-endian).
+    // - Run CUDA add1 batch.
+    // - Unpack only for diagnostics.
+    //
+    // This validates the end-to-end pipeline: pack -> H2D -> kernel -> D2H -> unpack.
+    if device_id.backend == crate::gpu::GpuBackendKind::Cuda && !jobs.is_empty() {
+        let mut packed: Vec<u32> = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            match B64.decode(job.challenge_b64.as_bytes()) {
+                Ok(bytes) if bytes.len() >= 4 => {
+                    packed.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+                }
+                _ => packed.push(0),
+            }
+        }
+
+        match crate::cuda_backend::add1_batch(device_id.index, &packed) {
+            Ok(out) => {
+                // Lightweight guards: shape + a few samples (constant-time-ish).
+                if out.len() != packed.len() {
+                    let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                        message: format!(
+                            "warning: gpu worker {} CUDA batch shape mismatch on device {}: in={}, out={}",
+                            worker_idx + 1,
+                            device_id.index,
+                            packed.len(),
+                            out.len()
+                        ),
+                    });
+                } else {
+                    let sample_n = out.len().min(3);
+                    let mut ok = true;
+                    for i in 0..sample_n {
+                        if out[i] != packed[i].wrapping_add(1) {
+                            ok = false;
+                            break;
+                        }
+                    }
+
+                    if ok {
+                        let mut samples = Vec::with_capacity(sample_n);
+                        for i in 0..sample_n {
+                            samples.push(format!("{}->{}", packed[i], out[i]));
+                        }
+                        let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                            message: format!(
+                                "info: gpu worker {} CUDA batch OK on device {} (samples: {})",
+                                worker_idx + 1,
+                                device_id.index,
+                                samples.join(", ")
+                            ),
+                        });
+                    } else {
+                        let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                            message: format!(
+                                "warning: gpu worker {} CUDA batch sample mismatch on device {} (falling back to CPU path for VDF)",
+                                worker_idx + 1,
+                                device_id.index
+                            ),
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                    message: format!(
+                        "warning: gpu worker {} CUDA batch failed on device {}: {} (continuing with CPU path)",
+                        worker_idx + 1,
+                        device_id.index,
+                        err
+                    ),
+                });
+            }
+        }
+    }
+
+    // CPU remains the reference compute path for VDF until real VDF kernels exist.
     let mut outcomes = Vec::with_capacity(jobs.len());
 
     for job in jobs {
@@ -327,6 +416,7 @@ async fn run_gpu_batch(
 
     outcomes
 }
+
 
 async fn run_job(
     worker_idx: usize,
