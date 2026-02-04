@@ -8,14 +8,14 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::api::{
-    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot, WorkerSnapshot,
-    WorkerStage,
+    EngineConfig, EngineEvent, EngineHandle, GpuBackend, JobOutcome, JobSummary, StatusSnapshot,
+    WorkerSnapshot, WorkerStage,
 };
 use crate::backend::{BackendJobDto, BackendWorkBatch, fetch_work};
 use crate::inflight::InflightStore;
 use crate::worker::{WorkerCommand, WorkerInternalEvent};
-
-const GPU_BATCH_SIZE_DEFAULT: usize = 1;
+use crate::gpu::{GpuBatchConfig, GpuSelectConfig};
+use crate::gpu_manager::build_plan;
 
 pub(crate) struct EngineInner {
     pub(crate) event_tx: broadcast::Sender<EngineEvent>,
@@ -42,6 +42,13 @@ struct WorkJobItem {
     lease_id: String,
     lease_expires_at: i64,
     job: BackendJobDto,
+}
+
+#[derive(Debug, Clone)]
+struct GpuDeviceRuntime {
+    label: String,
+    batch_size: usize,
+    min_batch: usize,
 }
 
 #[derive(Debug)]
@@ -143,7 +150,7 @@ struct EngineRuntime {
     cfg: EngineConfig,
 
     cpu_workers: usize,
-    gpu_workers: usize,
+    gpu_devices: Vec<GpuDeviceRuntime>,
 
     workers: Vec<WorkerRuntime>,
     worker_cmds: Vec<mpsc::Sender<WorkerCommand>>,
@@ -214,10 +221,11 @@ impl EngineRuntime {
     }
 
     fn gpu_idle_count(&self) -> usize {
+        let gpu_workers = self.gpu_devices.len();
         self.workers
             .iter()
             .skip(self.cpu_workers)
-            .take(self.gpu_workers)
+            .take(gpu_workers)
             .filter(|w| w.is_idle())
             .count()
     }
@@ -232,11 +240,15 @@ impl EngineRuntime {
         }
 
         let cpu_idle = self.cpu_idle_count();
-        let gpu_idle = self.gpu_idle_count();
-
         let mut demand = cpu_idle;
-        if self.gpu_workers > 0 {
-            demand = demand.saturating_add(gpu_idle.saturating_mul(GPU_BATCH_SIZE_DEFAULT));
+
+        // For each idle GPU worker, try to reserve up to its per-device batch size.
+        // This helps keep fetch_work sized to the effective throughput of active devices.
+        for (gpu_local_idx, dev) in self.gpu_devices.iter().enumerate() {
+            let worker_idx = self.cpu_workers + gpu_local_idx;
+            if self.workers.get(worker_idx).map(|w| w.is_idle()).unwrap_or(false) {
+                demand = demand.saturating_add(dev.batch_size.max(1));
+            }
         }
 
         if demand == 0 {
@@ -331,14 +343,16 @@ impl EngineRuntime {
         if self.inner.should_stop() {
             return Ok(());
         }
-        if self.gpu_workers == 0 {
+
+        let gpu_workers = self.gpu_devices.len();
+        if gpu_workers == 0 {
             return Ok(());
         }
 
         let mut snapshot_dirty = false;
 
-        for i in 0..self.gpu_workers {
-            let worker_idx = self.cpu_workers + i;
+        for (gpu_local_idx, dev) in self.gpu_devices.iter().enumerate() {
+            let worker_idx = self.cpu_workers + gpu_local_idx;
             if worker_idx >= self.workers.len() {
                 break;
             }
@@ -346,35 +360,28 @@ impl EngineRuntime {
                 continue;
             }
 
-            if self.pending.is_empty() {
-                break;
-            }
-
-            // In absence of an explicit config field, we keep a conservative default batch size.
-            let batch_size = GPU_BATCH_SIZE_DEFAULT;
-
-            let mut jobs = Vec::new();
-            let mut lease_id: Option<String> = None;
-            let mut lease_expires_at: i64 = 0;
-
-            for _ in 0..batch_size {
-                let Some(item) = self.pending.pop_front() else {
-                    break;
-                };
-
-                if lease_id.is_none() {
-                    lease_id = Some(item.lease_id.clone());
-                    lease_expires_at = item.lease_expires_at;
-                }
-
-                jobs.push(item.job);
-            }
-
-            let Some(lease_id) = lease_id else {
+            let Some(first) = self.pending.pop_front() else {
                 break;
             };
-            if jobs.is_empty() {
-                break;
+
+            let lease_id = first.lease_id;
+            let lease_expires_at = first.lease_expires_at;
+
+            // Keep batches within the same lease_id to avoid mixing leases in a single GPU submission.
+            // This is important because the backend may validate lease ownership per job.
+            let batch_size = dev.batch_size.max(1);
+            let mut jobs: Vec<BackendJobDto> = Vec::with_capacity(batch_size);
+            jobs.push(first.job);
+
+            while jobs.len() < batch_size {
+                let Some(next) = self.pending.front() else {
+                    break;
+                };
+                if next.lease_id != lease_id {
+                    break;
+                }
+                let next = self.pending.pop_front().expect("front checked");
+                jobs.push(next.job);
             }
 
             // Start the worker runtime with the first job so the UI is not empty.
@@ -403,7 +410,7 @@ impl EngineRuntime {
                     lease_expires_at,
                     progress_steps: self.cfg.progress_steps,
                     jobs,
-                    device_label: format!("{:?}:{}", self.cfg.gpu_backend, i),
+                    device_label: dev.label.clone(),
                 })
                 .await;
 
@@ -659,13 +666,71 @@ async fn run_engine(
     let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
 
     let cpu_workers = cfg.parallel;
-    let gpu_workers = if cfg.gpu_enabled && cfg.gpu_backend != crate::api::GpuBackend::Off {
-        // Without a dedicated per-device field in EngineConfig, we default to a single GPU worker.
-        1usize
-    } else {
-        0usize
+
+    // -----------------------------
+    // GPU device plan (selection + auto batch sizing)
+    // -----------------------------
+    let gpu_enabled_effective = cfg.gpu_enabled && cfg.gpu_backend != GpuBackend::Off;
+
+    let (allow_cuda, allow_opencl) = match cfg.gpu_backend {
+        GpuBackend::Auto => (true, true),
+        GpuBackend::Cuda => (true, false),
+        GpuBackend::Opencl => (false, true),
+        GpuBackend::Off => (false, false),
     };
 
+    let select_cfg = GpuSelectConfig {
+        enabled: gpu_enabled_effective,
+        allow_cuda,
+        allow_opencl,
+        max_devices: cfg.gpu_max_devices,
+        allowlist: cfg.gpu_device_allowlist.clone(),
+    };
+
+    let min_batch = cfg.gpu_batch_min.max(1);
+    let max_batch = cfg.gpu_batch_max.max(min_batch);
+
+    let batch_cfg = GpuBatchConfig {
+        min_batch,
+        max_batch,
+        vram_ratio: cfg.gpu_vram_ratio,
+        batch_timeout_ms: cfg.gpu_batch_timeout_ms,
+        inflight_batches: cfg.gpu_inflight_batches.max(1),
+    };
+
+    let plan = build_plan(&select_cfg, &batch_cfg);
+
+    if gpu_enabled_effective && plan.devices.is_empty() {
+        let _ = inner.event_tx.send(EngineEvent::Warning {
+            message: "warning: GPU enabled but no devices selected/detected; running CPU-only".to_string(),
+        });
+    } else if !plan.devices.is_empty() {
+        let _ = inner.event_tx.send(EngineEvent::Warning {
+            message: format!(
+                "GPU plan: {} device(s), min_batch_total={}",
+                plan.devices.len(),
+                plan.min_batch_total
+            ),
+        });
+
+        for (i, dev) in plan.devices.iter().enumerate() {
+            let _ = inner.event_tx.send(EngineEvent::Warning {
+                message: format!("GPU device {}: {}", i, dev),
+            });
+        }
+    }
+
+    let gpu_devices: Vec<GpuDeviceRuntime> = plan
+        .devices
+        .iter()
+        .map(|d| GpuDeviceRuntime {
+            label: d.info.label(),
+            batch_size: d.batch_size,
+            min_batch: d.min_batch,
+        })
+        .collect();
+
+    let gpu_workers = gpu_devices.len();
     let total_workers = cpu_workers.saturating_add(gpu_workers);
 
     let mut worker_cmds = Vec::with_capacity(total_workers);
@@ -827,7 +892,7 @@ async fn run_engine(
         http,
         cfg,
         cpu_workers,
-        gpu_workers,
+        gpu_devices,
         workers,
         worker_cmds,
         worker_progress,
