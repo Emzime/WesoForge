@@ -17,6 +17,21 @@ use crate::cpu_affinity::{CpuPinPolicy, pin_current_thread};
 
 const DISCRIMINANT_BITS: usize = 1024;
 
+// Global, process-wide switch to enable/disable CPU thread pinning.
+//
+// The engine can toggle this (for example from EngineConfig.cpu_pin_threads)
+// by calling `set_cpu_pinning_enabled(false)` before spawning CPU workers.
+static CPU_PINNING_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Enable/disable CPU thread pinning for CPU workers.
+///
+/// # Notes
+/// - This is process-wide and should be configured once at startup.
+/// - GPU workers are never pinned by `worker.rs`.
+pub(crate) fn set_cpu_pinning_enabled(enabled: bool) {
+    CPU_PINNING_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
 fn default_classgroup_element() -> [u8; 100] {
     let mut el = [0u8; 100];
     el[0] = 0x08;
@@ -42,8 +57,8 @@ pub(crate) enum WorkerCommand {
     ///
     /// Notes:
     /// - `worker_idx` should be unique across CPU + GPU workers (engine decides the numbering).
-    /// - The default implementation executes sequentially on CPU as a functional stub.
-    ///   CUDA/OpenCL backends can plug into this command later without changing engine/worker plumbing.
+    /// - The current implementation computes the batch sequentially on CPU as a functional stub.
+    ///   The CUDA/OpenCL backends will plug into this command in the next step.
     GpuBatch {
         worker_idx: usize,
         backend_url: Url,
@@ -65,7 +80,7 @@ pub(crate) enum WorkerInternalEvent {
 }
 
 pub(crate) async fn run_worker_task(
-    _worker_idx: usize,
+    worker_idx: usize,
     mut rx: mpsc::Receiver<WorkerCommand>,
     internal_tx: mpsc::UnboundedSender<WorkerInternalEvent>,
     progress: Arc<AtomicU64>,
@@ -92,32 +107,34 @@ pub(crate) async fn run_worker_task(
                 if !cpu_pinned {
                     cpu_pinned = true;
 
-                    // Best-effort CPU pinning.
-                    // On Windows/Linux, this pins the current thread. On macOS, it's a no-op.
-                    // The default policy is expected to:
-                    // - exclude core 0
-                    // - pin in reverse core order
-                    match pin_current_thread(worker_idx, CpuPinPolicy::default()) {
-                        Ok(Some(core_id)) => {
-                            let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                                message: format!(
-                                    "info: cpu worker {} pinned to core {} (core 0 reserved, reverse order)",
-                                    worker_idx + 1,
-                                    core_id
-                                ),
-                            });
-                        }
-                        Ok(None) => {
-                            // No warning needed: could be unsupported OS or no core list available.
-                        }
-                        Err(err) => {
-                            let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                                message: format!(
-                                    "warning: cpu worker {} pinning failed: {}",
-                                    worker_idx + 1,
-                                    err
-                                ),
-                            });
+                    if CPU_PINNING_ENABLED.load(Ordering::SeqCst) {
+                        // Best-effort CPU pinning.
+                        // On Windows/Linux, this pins the current thread. On macOS, it's a no-op.
+                        // The default policy is expected to:
+                        // - exclude core 0
+                        // - pin in reverse core order
+                        match pin_current_thread(worker_idx, CpuPinPolicy::default()) {
+                            Ok(Some(core_id)) => {
+                                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                                    message: format!(
+                                        "info: cpu worker {} pinned to core {} (core 0 reserved, reverse order)",
+                                        worker_idx + 1,
+                                        core_id
+                                    ),
+                                });
+                            }
+                            Ok(None) => {
+                                // No warning needed: could be unsupported OS or no core list available.
+                            }
+                            Err(err) => {
+                                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                                    message: format!(
+                                        "warning: cpu worker {} pinning failed: {}",
+                                        worker_idx + 1,
+                                        err
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -495,9 +512,8 @@ async fn submit_witness(
 ) -> Result<SubmitResponse, SubmitFailure> {
     let mut last_submit_err: Option<String> = None;
     let mut attempts: u32 = 0;
-    let mut last_log_at = Instant::now()
-        .checked_sub(Duration::from_secs(3600))
-        .unwrap_or_else(Instant::now);
+    let mut last_log_at =
+        Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
 
     loop {
         let now = Utc::now().timestamp();
