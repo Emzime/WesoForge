@@ -10,7 +10,6 @@ repository = "https://github.com/Chia-Network/chiavdf"
 
 [dependencies]
 link-cplusplus = "1.0.12"
-thiserror = "2"
 
 [build-dependencies]
 bindgen = "0.72.1"
