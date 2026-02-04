@@ -15,6 +15,8 @@ use crate::backend::{BackendJobDto, BackendWorkBatch, fetch_work};
 use crate::inflight::InflightStore;
 use crate::worker::{WorkerCommand, WorkerInternalEvent};
 
+const GPU_BATCH_SIZE_DEFAULT: usize = 1;
+
 pub(crate) struct EngineInner {
     pub(crate) event_tx: broadcast::Sender<EngineEvent>,
     pub(crate) snapshot_rx: watch::Receiver<StatusSnapshot>,
@@ -140,6 +142,9 @@ struct EngineRuntime {
     http: reqwest::Client,
     cfg: EngineConfig,
 
+    cpu_workers: usize,
+    gpu_workers: usize,
+
     workers: Vec<WorkerRuntime>,
     worker_cmds: Vec<mpsc::Sender<WorkerCommand>>,
     worker_progress: Vec<Arc<std::sync::atomic::AtomicU64>>,
@@ -147,6 +152,9 @@ struct EngineRuntime {
 
     // Dedicated OS threads for CPU workers (each runs a current-thread Tokio runtime).
     worker_threads: Vec<std::thread::JoinHandle<()>>,
+
+    // Async tasks for GPU workers.
+    gpu_tasks: Vec<tokio::task::JoinHandle<()>>,
 
     pending: VecDeque<WorkJobItem>,
     fetch_task: Option<tokio::task::JoinHandle<anyhow::Result<Vec<WorkJobItem>>>>,
@@ -197,27 +205,25 @@ impl EngineRuntime {
         let _ = self.inner.event_tx.send(event);
     }
 
-    fn idle_count(&self) -> usize {
-        self.workers.iter().filter(|w| w.is_idle()).count()
+    fn cpu_idle_count(&self) -> usize {
+        self.workers
+            .iter()
+            .take(self.cpu_workers)
+            .filter(|w| w.is_idle())
+            .count()
+    }
+
+    fn gpu_idle_count(&self) -> usize {
+        self.workers
+            .iter()
+            .skip(self.cpu_workers)
+            .take(self.gpu_workers)
+            .filter(|w| w.is_idle())
+            .count()
     }
 
     fn all_idle(&self) -> bool {
         !self.workers.iter().any(|w| w.is_busy())
-    }
-
-    fn maybe_warn_gpu_not_ready(&self) {
-        if !self.cfg.gpu_enabled {
-            return;
-        }
-        if self.cfg.gpu_backend == crate::api::GpuBackend::Off {
-            return;
-        }
-
-        // GPU orchestration is prepared (config + plumbing),
-        // but compute/dispatch is implemented in the next patch.
-        self.emit(EngineEvent::Warning {
-            message: "warning: GPU is enabled in config but GPU workers are not wired yet in this build; running CPU-only (CUDA/OpenCL batch worker will be added next).".to_string(),
-        });
     }
 
     fn maybe_start_fetch(&mut self) {
@@ -225,8 +231,15 @@ impl EngineRuntime {
             return;
         }
 
-        let cpu_idle = self.idle_count();
-        if cpu_idle == 0 {
+        let cpu_idle = self.cpu_idle_count();
+        let gpu_idle = self.gpu_idle_count();
+
+        let mut demand = cpu_idle;
+        if self.gpu_workers > 0 {
+            demand = demand.saturating_add(gpu_idle.saturating_mul(GPU_BATCH_SIZE_DEFAULT));
+        }
+
+        if demand == 0 {
             return;
         }
 
@@ -237,9 +250,7 @@ impl EngineRuntime {
         let http = self.http.clone();
         let backend = self.cfg.backend_url.clone();
 
-        // For now, fetch based on CPU needs only.
-        // Next patch: include GPU batch demand in count.
-        let count = cpu_idle;
+        let count = demand;
 
         self.fetch_task = Some(tokio::spawn(async move {
             let count = count.min(u32::MAX as usize) as u32;
@@ -265,7 +276,7 @@ impl EngineRuntime {
 
         let mut snapshot_dirty = false;
 
-        for idx in 0..self.workers.len() {
+        for idx in 0..self.cpu_workers {
             if !self.workers[idx].is_idle() {
                 continue;
             }
@@ -316,9 +327,111 @@ impl EngineRuntime {
         Ok(())
     }
 
+    async fn assign_jobs_gpu(&mut self) -> anyhow::Result<()> {
+        if self.inner.should_stop() {
+            return Ok(());
+        }
+        if self.gpu_workers == 0 {
+            return Ok(());
+        }
+
+        let mut snapshot_dirty = false;
+
+        for i in 0..self.gpu_workers {
+            let worker_idx = self.cpu_workers + i;
+            if worker_idx >= self.workers.len() {
+                break;
+            }
+            if !self.workers[worker_idx].is_idle() {
+                continue;
+            }
+
+            if self.pending.is_empty() {
+                break;
+            }
+
+            // In absence of an explicit config field, we keep a conservative default batch size.
+            let batch_size = GPU_BATCH_SIZE_DEFAULT;
+
+            let mut jobs = Vec::new();
+            let mut lease_id: Option<String> = None;
+            let mut lease_expires_at: i64 = 0;
+
+            for _ in 0..batch_size {
+                let Some(item) = self.pending.pop_front() else {
+                    break;
+                };
+
+                if lease_id.is_none() {
+                    lease_id = Some(item.lease_id.clone());
+                    lease_expires_at = item.lease_expires_at;
+                }
+
+                jobs.push(item.job);
+            }
+
+            let Some(lease_id) = lease_id else {
+                break;
+            };
+            if jobs.is_empty() {
+                break;
+            }
+
+            // Start the worker runtime with the first job so the UI is not empty.
+            let first = &jobs[0];
+            let job_summary = JobSummary {
+                job_id: first.job_id,
+                height: first.height,
+                field_vdf: first.field_vdf,
+                number_of_iterations: first.number_of_iterations,
+            };
+
+            {
+                let w = &mut self.workers[worker_idx];
+                w.start_job(job_summary.clone());
+            }
+
+            self.worker_progress
+                .get(worker_idx)
+                .map(|p| p.store(0, std::sync::atomic::Ordering::Relaxed));
+
+            let _ = self.worker_cmds[worker_idx]
+                .send(WorkerCommand::GpuBatch {
+                    worker_idx,
+                    backend_url: self.cfg.backend_url.clone(),
+                    lease_id,
+                    lease_expires_at,
+                    progress_steps: self.cfg.progress_steps,
+                    jobs,
+                    device_label: format!("{:?}:{}", self.cfg.gpu_backend, i),
+                })
+                .await;
+
+            self.emit(EngineEvent::WorkerJobStarted {
+                worker_idx,
+                job: job_summary,
+            });
+
+            snapshot_dirty = true;
+        }
+
+        if snapshot_dirty {
+            self.push_snapshot();
+        }
+
+        Ok(())
+    }
+
     async fn shutdown_workers(&mut self) {
         for tx in &self.worker_cmds {
             let _ = tx.send(WorkerCommand::Stop).await;
+        }
+
+        // Join GPU tasks first (they run on the async scheduler).
+        let mut gpu_tasks = Vec::new();
+        std::mem::swap(&mut gpu_tasks, &mut self.gpu_tasks);
+        for t in gpu_tasks {
+            let _ = t.await;
         }
 
         let mut handles = Vec::new();
@@ -385,9 +498,6 @@ impl EngineRuntime {
 
     async fn run(mut self) -> anyhow::Result<()> {
         self.emit(EngineEvent::Started);
-
-        // Warn once if GPU enabled but not wired yet.
-        self.maybe_warn_gpu_not_ready();
 
         let mut tick = tokio::time::interval(self.cfg.progress_tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -473,6 +583,13 @@ impl EngineRuntime {
                 break;
             }
 
+            if let Err(err) = self.assign_jobs_gpu().await {
+                let message = format!("assign gpu jobs failed: {err:#}");
+                self.emit(EngineEvent::Error { message: message.clone() });
+                result = Err(anyhow::anyhow!("{message}"));
+                break;
+            }
+
             let now = Instant::now();
             if now.duration_since(last_snapshot_at) >= Duration::from_secs(1) {
                 last_snapshot_at = now;
@@ -541,14 +658,25 @@ async fn run_engine(
     // Spawn CPU worker threads (each owns its own current-thread Tokio runtime).
     let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
 
-    let mut worker_cmds = Vec::with_capacity(cfg.parallel);
-    let mut worker_progress = Vec::with_capacity(cfg.parallel);
-    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(cfg.parallel);
+    let cpu_workers = cfg.parallel;
+    let gpu_workers = if cfg.gpu_enabled && cfg.gpu_backend != crate::api::GpuBackend::Off {
+        // Without a dedicated per-device field in EngineConfig, we default to a single GPU worker.
+        1usize
+    } else {
+        0usize
+    };
+
+    let total_workers = cpu_workers.saturating_add(gpu_workers);
+
+    let mut worker_cmds = Vec::with_capacity(total_workers);
+    let mut worker_progress = Vec::with_capacity(total_workers);
+    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(cpu_workers);
+    let mut gpu_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(gpu_workers);
 
     let submitter = Arc::new(tokio::sync::RwLock::new(cfg.submitter.clone()));
     let warned_invalid_reward_address = Arc::new(AtomicBool::new(false));
 
-    for worker_idx in 0..cfg.parallel {
+    for worker_idx in 0..cpu_workers {
         let (tx, rx) = mpsc::channel::<WorkerCommand>(1);
         worker_cmds.push(tx);
 
@@ -600,11 +728,44 @@ async fn run_engine(
             Ok(h) => worker_threads.push(h),
             Err(err) => {
                 let _ = inner.event_tx.send(EngineEvent::Error {
-                    message: format!("error: failed to spawn cpu worker thread {}: {err:#}", worker_idx + 1),
+                    message: format!(
+                        "error: failed to spawn cpu worker thread {}: {err:#}",
+                        worker_idx + 1
+                    ),
                 });
                 return Err(anyhow::anyhow!("failed to spawn cpu worker thread"));
             }
         }
+    }
+
+    // Spawn GPU worker tasks (async, not pinned to CPU cores).
+    for gpu_local_idx in 0..gpu_workers {
+        let worker_idx = cpu_workers + gpu_local_idx;
+        let (tx, rx) = mpsc::channel::<WorkerCommand>(1);
+        worker_cmds.push(tx);
+
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        worker_progress.push(progress.clone());
+
+        let internal_tx = internal_tx.clone();
+        let http = http.clone();
+        let submitter = submitter.clone();
+        let warned = warned_invalid_reward_address.clone();
+
+        let task = tokio::spawn(async move {
+            crate::worker::run_worker_task(
+                worker_idx,
+                rx,
+                internal_tx,
+                progress,
+                http,
+                submitter,
+                warned,
+            )
+            .await;
+        });
+
+        gpu_tasks.push(task);
     }
 
     // Load inflight leases (resume).
@@ -660,16 +821,19 @@ async fn run_engine(
         }
     }
 
-    let workers = (0..cfg.parallel).map(|_| WorkerRuntime::new()).collect();
+    let workers = (0..total_workers).map(|_| WorkerRuntime::new()).collect();
 
     let runtime = EngineRuntime {
         http,
         cfg,
+        cpu_workers,
+        gpu_workers,
         workers,
         worker_cmds,
         worker_progress,
         internal_rx,
         worker_threads,
+        gpu_tasks,
         pending,
         fetch_task: None,
         fetch_backoff: None,
