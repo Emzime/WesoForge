@@ -10,6 +10,19 @@ use anyhow::Context as _;
 
 use cust::prelude::*;
 
+fn create_context(device_index: usize) -> anyhow::Result<Context> {
+    // cust::Device::get_device expects a u32 ordinal.
+    let ordinal: u32 = u32::try_from(device_index).context("device_index too large for u32")?;
+
+    let dev = Device::get_device(ordinal)
+        .with_context(|| format!("CUDA device {device_index} not available"))?;
+
+    // In cust 0.3.x, Context::new retains the device's primary context and makes it current
+    // on the calling thread.
+    let ctx = Context::new(dev).context("failed to create CUDA context")?;
+    Ok(ctx)
+}
+
 /// Run a minimal CUDA end-to-end kernel test on a selected device.
 ///
 /// This function validates:
@@ -23,12 +36,7 @@ use cust::prelude::*;
 pub fn add1_smoketest(device_index: usize, n: usize) -> anyhow::Result<()> {
     init_cuda().context("CUDA init")?;
 
-    let dev = Device::get_device(device_index)
-        .with_context(|| format!("CUDA device {device_index} not available"))?;
-
-    // Context must be current on the calling thread.
-    let _ctx = Context::create_and_push(ContextFlags::SCHED_AUTO, dev)
-        .context("failed to create CUDA context")?;
+    let _ctx = create_context(device_index)?;
 
     let module = unsafe { Module::from_ptx(ADD1_PTX, &[]) }.context("failed to load PTX module")?;
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None).context("failed to create stream")?;
@@ -86,12 +94,7 @@ pub fn add1_smoketest(device_index: usize, n: usize) -> anyhow::Result<()> {
 pub fn add1_execute(device_index: usize, input: &[u32]) -> anyhow::Result<Vec<u32>> {
     init_cuda().context("CUDA init")?;
 
-    let dev = Device::get_device(device_index)
-        .with_context(|| format!("CUDA device {device_index} not available"))?;
-
-    // Context must be current on the calling thread.
-    let _ctx = Context::create_and_push(ContextFlags::SCHED_AUTO, dev)
-        .context("failed to create CUDA context")?;
+    let _ctx = create_context(device_index)?;
 
     let module = unsafe { Module::from_ptx(ADD1_PTX, &[]) }.context("failed to load PTX module")?;
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None).context("failed to create stream")?;
@@ -163,12 +166,7 @@ pub fn prove_stub_execute(
         challenges_words.len()
     );
 
-    let dev = Device::get_device(device_index)
-        .with_context(|| format!("CUDA device {device_index} not available"))?;
-
-    // Context must be current on the calling thread.
-    let _ctx = Context::create_and_push(ContextFlags::SCHED_AUTO, dev)
-        .context("failed to create CUDA context")?;
+    let _ctx = create_context(device_index)?;
 
     let module = unsafe { Module::from_ptx(PROVE_STUB_PTX, &[]) }
         .context("failed to load PTX module")?;
@@ -253,12 +251,7 @@ pub fn prove_vdf_execute(
         return Ok(Vec::new());
     }
 
-    let dev = Device::get_device(device_index)
-        .with_context(|| format!("CUDA device {device_index} not available"))?;
-
-    // Context must be current on the calling thread.
-    let _ctx = Context::create_and_push(ContextFlags::SCHED_AUTO, dev)
-        .context("failed to create CUDA context")?;
+    let _ctx = create_context(device_index)?;
 
     let module = unsafe { Module::from_ptx(VDF_PTX, &[]) }
         .context("failed to load VDF PTX module")?;
