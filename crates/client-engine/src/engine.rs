@@ -7,11 +7,14 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::backend::{fetch_work, BackendJobDto, BackendWorkBatch};
 use crate::api::{
     EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot, WorkerSnapshot,
     WorkerStage,
 };
-\1use crate::cpu_affinity::parse_core_list;
+use crate::cpu_affinity::parse_core_list;
+use crate::gpu::{GpuBackendKind, GpuBatchConfig, GpuSelectConfig};
+use crate::gpu_manager;
 use crate::inflight::InflightStore;
 use crate::worker::{WorkerCommand, WorkerInternalEvent};
 
@@ -69,18 +72,14 @@ impl WorkerRuntime {
     }
 
     fn is_idle(&self) -> bool {
-        self.stage == WorkerStage::Idle
-    }
-
-    fn is_busy(&self) -> bool {
-        self.stage != WorkerStage::Idle
+        matches!(self.stage, WorkerStage::Idle)
     }
 
     fn start_job(&mut self, job: JobSummary) {
         self.stage = WorkerStage::Computing;
-        self.job = Some(job.clone());
         self.iters_total = job.number_of_iterations;
-        self.last_speed_sample_at = Some(Instant::now());
+        self.job = Some(job);
+        self.last_speed_sample_at = None;
         self.prev_speed_interval = None;
         self.speed_its_per_sec = 0;
         self.last_reported_iters_done = 0;
@@ -91,7 +90,7 @@ impl WorkerRuntime {
         self.stage = stage;
     }
 
-    fn finish_job(&mut self) {
+    fn clear_job(&mut self) {
         self.stage = WorkerStage::Idle;
         self.job = None;
         self.iters_total = 0;
@@ -102,26 +101,18 @@ impl WorkerRuntime {
         self.last_emitted_iters_done = 0;
     }
 
-    fn apply_progress(&mut self, iters_done: u64) -> Option<u64> {
-        let total_iters = self.iters_total;
-        if total_iters == 0 {
-            return None;
-        }
-
+    fn update_speed(&mut self, iters_done: u64) -> Option<u64> {
         let now = Instant::now();
-        let iters_done = iters_done.min(total_iters);
-        let delta = iters_done.saturating_sub(self.last_reported_iters_done);
-        if delta == 0 {
-            return None;
-        }
 
         if let Some(last_at) = self.last_speed_sample_at {
             let dt = now.duration_since(last_at);
-            let (sum_iters, sum_dt) = if let Some((prev_iters, prev_dt)) = self.prev_speed_interval {
-                (prev_iters.saturating_add(delta), prev_dt + dt)
-            } else {
-                (delta, dt)
-            };
+            if dt < Duration::from_millis(200) {
+                return None;
+            }
+
+            let prev_iters = self.last_reported_iters_done;
+            let sum_iters = iters_done.saturating_sub(prev_iters);
+            let sum_dt = dt;
 
             if sum_dt.as_secs_f64() > 0.0 {
                 self.speed_its_per_sec = (sum_iters as f64 / sum_dt.as_secs_f64()).round() as u64;
@@ -139,6 +130,16 @@ impl WorkerRuntime {
 struct EngineRuntime {
     http: reqwest::Client,
     cfg: EngineConfig,
+
+    // Worker topology
+    cpu_workers: usize,
+    gpu_workers: usize,
+    gpu_device_label: Option<String>,
+    gpu_backend_kind: Option<GpuBackendKind>,
+    gpu_batch_started_at: Option<Instant>,
+    gpu_min_batch: usize,
+    gpu_max_batch: usize,
+    gpu_batch_timeout: Duration,
 
     workers: Vec<WorkerRuntime>,
     worker_cmds: Vec<mpsc::Sender<WorkerCommand>>,
@@ -189,23 +190,41 @@ impl EngineRuntime {
     }
 
     fn push_snapshot(&self) {
-        let snap = self.build_snapshot();
-        let _ = self.snapshot_tx.send(snap);
+        let _ = self.snapshot_tx.send(self.build_snapshot());
     }
 
-    fn emit(&self, event: EngineEvent) {
-        let _ = self.inner.event_tx.send(event);
+    fn emit(&self, ev: EngineEvent) {
+        let _ = self.inner.event_tx.send(ev);
     }
 
     fn idle_count(&self) -> usize {
         self.workers.iter().filter(|w| w.is_idle()).count()
     }
 
-    fn all_idle(&self) -> bool {
-        !self.workers.iter().any(|w| w.is_busy())
+    fn update_speeds_and_emit(&mut self) {
+        let mut any_progress = false;
+        let mut sum_speed: u64 = 0;
+
+        for (idx, w) in self.workers.iter_mut().enumerate() {
+            let iters_done = self
+                .worker_progress
+                .get(idx)
+                .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0);
+
+            if w.update_speed(iters_done).is_some() {
+                any_progress = true;
+            }
+            sum_speed = sum_speed.saturating_add(w.speed_its_per_sec);
+        }
+
+        if any_progress && sum_speed != self.last_speed_emitted {
+            self.last_speed_emitted = sum_speed;
+            self.emit(EngineEvent::Speed { iters_per_sec: sum_speed });
+        }
     }
 
-    fn maybe_warn_gpu_not_ready(&self) {
+    fn maybe_warn_gpu_enabled(&self) {
         if !self.cfg.gpu_enabled {
             return;
         }
@@ -213,10 +232,9 @@ impl EngineRuntime {
             return;
         }
 
-        // GPU orchestration is prepared (config + plumbing),
-        // but compute/dispatch is implemented in the next patch.
         self.emit(EngineEvent::Warning {
-            message: "warning: GPU is enabled in config but GPU workers are not wired yet in this build; running CPU-only (CUDA/OpenCL batch worker will be added next).".to_string(),
+            message: "info: GPU is enabled; a minimal GPU batch worker is active (compute may still fall back to CPU depending on backend availability)."
+                .to_string(),
         });
     }
 
@@ -234,12 +252,15 @@ impl EngineRuntime {
             return;
         }
 
+        // If we have inflight items, process them first.
+        let inflight_count = self.inflight.as_ref().map(|i| i.len()).unwrap_or(0);
+        if inflight_count > 0 {
+            return;
+        }
+
         let http = self.http.clone();
         let backend = self.cfg.backend_url.clone();
-
-        // For now, fetch based on CPU needs only.
-        // Next patch: include GPU batch demand in count.
-        let count = cpu_idle;
+        let count = cpu_idle.min(128);
 
         self.fetch_task = Some(tokio::spawn(async move {
             let count = count.min(u32::MAX as usize) as u32;
@@ -247,14 +268,110 @@ impl EngineRuntime {
             let items = batch
                 .jobs
                 .into_iter()
-                .map(|job| WorkJobItem {
+                .map(|item| WorkJobItem {
                     lease_id: batch.lease_id.clone(),
                     lease_expires_at: batch.lease_expires_at,
-                    job,
+                    job: item,
                 })
                 .collect();
             Ok(items)
         }));
+    }
+
+    async fn assign_jobs_gpu(&mut self) -> anyhow::Result<()> {
+        if self.gpu_workers == 0 {
+            return Ok(());
+        }
+        if self.inner.should_stop() {
+            self.pending.clear();
+            return Ok(());
+        }
+
+        // Minimal batching logic:
+        // - never mix different lease_id / lease_expires_at in the same batch
+        // - launch when pending >= min_batch, or when timeout elapses with any pending
+        let now = Instant::now();
+        if self.gpu_batch_started_at.is_none() && !self.pending.is_empty() {
+            self.gpu_batch_started_at = Some(now);
+        }
+
+        let timed_out = self
+            .gpu_batch_started_at
+            .map(|t| now.duration_since(t) >= self.gpu_batch_timeout)
+            .unwrap_or(false);
+
+        if self.pending.len() < self.gpu_min_batch && !timed_out {
+            return Ok(());
+        }
+
+        for idx in self.cpu_workers..(self.cpu_workers + self.gpu_workers) {
+            if !self.workers[idx].is_idle() {
+                continue;
+            }
+
+            let Some(first) = self.pending.front() else {
+                break;
+            };
+
+            let lease_id = first.lease_id.clone();
+            let lease_expires_at = first.lease_expires_at;
+
+            let mut jobs: Vec<BackendJobDto> = Vec::new();
+            while jobs.len() < self.gpu_max_batch {
+                let Some(front) = self.pending.front() else {
+                    break;
+                };
+                if front.lease_id != lease_id || front.lease_expires_at != lease_expires_at {
+                    break;
+                }
+                let item = self.pending.pop_front().expect("pending front exists");
+                jobs.push(item.job);
+            }
+
+            if jobs.is_empty() {
+                break;
+            }
+
+            // Track first job in UI snapshot for this worker.
+            let first_job = &jobs[0];
+            let job_summary = JobSummary {
+                job_id: first_job.job_id,
+                height: first_job.height,
+                field_vdf: first_job.field_vdf,
+                number_of_iterations: first_job.number_of_iterations,
+            };
+
+            {
+                let worker = &mut self.workers[idx];
+                worker.start_job(job_summary.clone());
+            }
+
+            self.worker_progress
+                .get(idx)
+                .map(|p| p.store(0, std::sync::atomic::Ordering::Relaxed));
+
+            let device_label = self
+                .gpu_device_label
+                .clone()
+                .unwrap_or_else(|| "GPU".to_string());
+
+            let _ = self.worker_cmds[idx]
+                .send(WorkerCommand::GpuBatch {
+                    worker_idx: idx,
+                    backend_url: self.cfg.backend_url.clone(),
+                    lease_id,
+                    lease_expires_at,
+                    progress_steps: self.cfg.progress_steps,
+                    jobs,
+                    device_label,
+                })
+                .await;
+
+            // Reset batch timer after a launch.
+            self.gpu_batch_started_at = None;
+        }
+
+        Ok(())
     }
 
     async fn assign_jobs_cpu(&mut self) -> anyhow::Result<()> {
@@ -265,7 +382,7 @@ impl EngineRuntime {
 
         let mut snapshot_dirty = false;
 
-        for idx in 0..self.workers.len() {
+        for idx in 0..self.cpu_workers {
             if !self.workers[idx].is_idle() {
                 continue;
             }
@@ -301,7 +418,7 @@ impl EngineRuntime {
                 })
                 .await;
 
-            self.emit(EngineEvent::WorkerJobStarted {
+            self.emit(EngineEvent::StartedJob {
                 worker_idx: idx,
                 job: job_summary,
             });
@@ -316,127 +433,64 @@ impl EngineRuntime {
         Ok(())
     }
 
-    async fn shutdown_workers(&mut self) {
-        for tx in &self.worker_cmds {
-            let _ = tx.send(WorkerCommand::Stop).await;
-        }
-
-        let mut handles = Vec::new();
-        std::mem::swap(&mut handles, &mut self.worker_threads);
-
-        // Join threads without blocking the async reactor.
-        let join_res = tokio::task::spawn_blocking(move || {
-            for h in handles {
-                let _ = h.join();
+    fn handle_worker_event(&mut self, ev: WorkerInternalEvent) {
+        match ev {
+            WorkerInternalEvent::StageChanged { worker_idx, stage } => {
+                if let Some(w) = self.workers.get_mut(worker_idx) {
+                    w.set_stage(stage);
+                }
             }
-        })
-        .await;
+            WorkerInternalEvent::Finished { outcome } => {
+                if let Some(w) = self.workers.get_mut(outcome.worker_idx) {
+                    w.clear_job();
+                }
 
-        if let Err(err) = join_res {
-            self.emit(EngineEvent::Warning {
-                message: format!("warning: join cpu worker threads task failed: {err:#}"),
-            });
+                if self.recent_jobs.len() >= self.cfg.recent_jobs_max {
+                    self.recent_jobs.pop_front();
+                }
+                self.recent_jobs.push_back(outcome.clone());
+
+                self.emit(EngineEvent::FinishedJob { outcome });
+            }
+            WorkerInternalEvent::Warning { message } => {
+                self.emit(EngineEvent::Warning { message });
+            }
+            WorkerInternalEvent::Error { message } => {
+                self.emit(EngineEvent::Error { message });
+            }
         }
     }
 
-    fn update_speeds_and_emit(&mut self) {
-        let mut total_speed: u64 = 0;
-        let mut busy: usize = 0;
-
-        for (idx, w) in self.workers.iter_mut().enumerate() {
-            if w.is_busy() {
-                busy += 1;
-            }
-
-            if w.iters_total == 0 {
-                continue;
-            }
-
-            let iters_done = self
-                .worker_progress
-                .get(idx)
-                .map(|p| p.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(0);
-
-            if let Some(iters_done) = w.apply_progress(iters_done) {
-                if iters_done != w.last_emitted_iters_done {
-                    w.last_emitted_iters_done = iters_done;
-                    self.emit(EngineEvent::WorkerProgress {
-                        worker_idx: idx,
-                        iters_done,
-                        iters_total: w.iters_total,
-                        iters_per_sec: w.speed_its_per_sec,
-                    });
-                }
-            }
-
-            total_speed = total_speed.saturating_add(w.speed_its_per_sec);
+    async fn shutdown_workers(&mut self) {
+        for tx in &self.worker_cmds {
+            let _ = tx.send(WorkerCommand::Shutdown).await;
         }
 
-        if total_speed != self.last_speed_emitted {
-            self.last_speed_emitted = total_speed;
-            self.emit(EngineEvent::Speed {
-                iters_per_sec: total_speed,
-                busy,
-                total: self.workers.len(),
-            });
+        for h in self.worker_threads.drain(..) {
+            let _ = h.join();
         }
     }
 
     async fn run(mut self) -> anyhow::Result<()> {
-        self.emit(EngineEvent::Started);
-
-        // Warn once if GPU enabled but not wired yet.
-        self.maybe_warn_gpu_not_ready();
-
-        let mut tick = tokio::time::interval(self.cfg.progress_tick);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        self.maybe_warn_gpu_enabled();
+        self.push_snapshot();
 
         let mut last_snapshot_at = Instant::now();
         let mut result: anyhow::Result<()> = Ok(());
 
         loop {
-            if self.inner.should_stop() && self.all_idle() {
+            if self.inner.should_stop() {
                 break;
             }
 
             self.maybe_start_fetch();
 
             tokio::select! {
-                _ = self.inner.notify.notified() => {}
-                _ = tick.tick() => {}
                 Some(ev) = self.internal_rx.recv() => {
-                    match ev {
-                        WorkerInternalEvent::StageChanged { worker_idx, stage } => {
-                            if let Some(w) = self.workers.get_mut(worker_idx) {
-                                w.set_stage(stage);
-                            }
-                            self.push_snapshot();
-                            self.emit(EngineEvent::WorkerStage { worker_idx, stage });
-                        }
-                        WorkerInternalEvent::Finished { outcome } => {
-                            let worker_idx = outcome.worker_idx;
-                            if let Some(w) = self.workers.get_mut(worker_idx) {
-                                w.finish_job();
-                            }
-                            self.recent_jobs.push_back(outcome.clone());
-                            while self.recent_jobs.len() > self.cfg.recent_jobs_max {
-                                self.recent_jobs.pop_front();
-                            }
-                            self.push_snapshot();
-                            self.emit(EngineEvent::JobFinished { outcome });
-                        }
-                        WorkerInternalEvent::Warning { message } => {
-                            self.emit(EngineEvent::Warning { message });
-                        }
-                        WorkerInternalEvent::Error { message } => {
-                            self.emit(EngineEvent::Error { message });
-                        }
-                    }
+                    self.handle_worker_event(ev);
                 }
-                Some(res) = async { self.fetch_task.as_mut().map(|h| h.await).transpose() } => {
-                    self.fetch_task = None;
-                    match res {
+                Some(task) = async { self.fetch_task.take() } => {
+                    match task.await {
                         Ok(Ok(items)) => {
                             for item in items {
                                 self.pending.push_back(item);
@@ -464,6 +518,13 @@ impl EngineRuntime {
                     self.fetch_backoff = None;
                 }
                 _ = tokio::time::sleep(self.cfg.idle_sleep), if self.pending.is_empty() => {}
+            }
+
+            if let Err(err) = self.assign_jobs_gpu().await {
+                let message = format!("assign gpu batch failed: {err:#}");
+                self.emit(EngineEvent::Error { message: message.clone() });
+                result = Err(anyhow::anyhow!("{message}"));
+                break;
             }
 
             if let Err(err) = self.assign_jobs_cpu().await {
@@ -541,54 +602,98 @@ async fn run_engine(
     // Spawn CPU worker threads (each owns its own current-thread Tokio runtime).
     let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
 
-    let mut worker_cmds = Vec::with_capacity(cfg.parallel);
-    let mut worker_progress = Vec::with_capacity(cfg.parallel);
-    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(cfg.parallel);
+    let mut worker_cmds = Vec::with_capacity(total_workers);
+    let mut worker_progress = Vec::with_capacity(total_workers);
+    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(total_workers);
 
     let submitter = Arc::new(tokio::sync::RwLock::new(cfg.submitter.clone()));
     let warned_invalid_reward_address = Arc::new(AtomicBool::new(false));
-// ----------------------------------------
-// CPU pinning configuration (process-wide)
-// ----------------------------------------
-// Comments in English as requested.
-crate::worker::set_cpu_pinning_enabled(cfg.cpu_pin_threads);
-crate::worker::set_cpu_pin_policy(cfg.cpu_reserve_core0, cfg.cpu_reverse_cores);
 
-// Optional core allow/block lists, parsed once here and stored process-wide.
-// This avoids changing the worker command enum and keeps the project structure intact.
-let allowlist = match cfg.cpu_core_allowlist.as_deref() {
-    Some(spec) if !spec.trim().is_empty() => match parse_core_list(spec) {
-        Ok(v) => Some(v),
-        Err(err) => {
-            let _ = inner.event_tx.send(EngineEvent::Warning {
-                message: format!(
-                    "warning: invalid --cpu-cores specification {spec:?}: {err}; ignoring allowlist"
-                ),
-            });
-            None
+    // -----------------------------
+    // GPU plan (minimal: 1 device)
+    // -----------------------------
+    // Comments in English as requested.
+    let (gpu_workers, gpu_device_label, gpu_backend_kind, gpu_min_batch, gpu_max_batch, gpu_batch_timeout) = {
+        if !cfg.gpu_enabled || cfg.gpu_backend == crate::api::GpuBackend::Off {
+            (0usize, None, None, cfg.gpu_batch_min.max(1), cfg.gpu_batch_max.max(1), Duration::from_millis(cfg.gpu_batch_timeout_ms as u64))
+        } else {
+            let (allow_cuda, allow_opencl) = match cfg.gpu_backend {
+                crate::api::GpuBackend::Auto => (true, true),
+                crate::api::GpuBackend::Cuda => (true, false),
+                crate::api::GpuBackend::Opencl => (false, true),
+                crate::api::GpuBackend::Off => (false, false),
+            };
+
+            let select = GpuSelectConfig {
+                enabled: true,
+                allow_cuda,
+                allow_opencl,
+                max_devices: cfg.gpu_max_devices,
+                allowlist: cfg.gpu_device_allowlist.clone(),
+            };
+
+            let batch_cfg = GpuBatchConfig {
+                min_batch: cfg.gpu_batch_min.max(1),
+                max_batch: cfg.gpu_batch_max.max(cfg.gpu_batch_min.max(1)),
+                vram_ratio: cfg.gpu_vram_ratio,
+                batch_timeout_ms: cfg.gpu_batch_timeout_ms,
+                inflight_batches: cfg.gpu_inflight_batches.max(1),
+            };
+
+            let plan = gpu_manager::build_plan(&select, &batch_cfg);
+            if let Some(dev) = plan.devices.first() {
+                (
+                    1usize,
+                    Some(dev.info.label()),
+                    Some(dev.info.backend),
+                    dev.min_batch.max(1),
+                    dev.batch_size.max(1),
+                    Duration::from_millis(cfg.gpu_batch_timeout_ms as u64),
+                )
+            } else {
+                (0usize, None, None, batch_cfg.min_batch, batch_cfg.max_batch, Duration::from_millis(cfg.gpu_batch_timeout_ms as u64))
+            }
         }
-    },
-    _ => None,
-};
+    };
 
-let blocklist = match cfg.cpu_core_blocklist.as_deref() {
-    Some(spec) if !spec.trim().is_empty() => match parse_core_list(spec) {
-        Ok(v) => Some(v),
-        Err(err) => {
-            let _ = inner.event_tx.send(EngineEvent::Warning {
-                message: format!(
-                    "warning: invalid --cpu-cores-exclude specification {spec:?}: {err}; ignoring blocklist"
-                ),
-            });
-            None
-        }
-    },
-    _ => None,
-};
+    let total_workers = cfg.parallel + gpu_workers;
 
-crate::worker::set_cpu_core_allowlist(allowlist);
-crate::worker::set_cpu_core_blocklist(blocklist);
+    // ----------------------------------------
+    // CPU pinning configuration (process-wide)
+    // ----------------------------------------
+    // Comments in English as requested.
+    crate::worker::set_cpu_pinning_enabled(cfg.cpu_pin_threads);
+    crate::worker::set_cpu_pin_policy(cfg.cpu_reserve_core0, cfg.cpu_reverse_cores);
 
+    // Optional core allow/block lists, parsed once here and stored process-wide.
+    // This avoids changing the worker command enum and keeps the project structure intact.
+    let allowlist = match cfg.cpu_core_allowlist.as_deref() {
+        Some(spec) if !spec.trim().is_empty() => match parse_core_list(spec) {
+            Ok(v) => Some(v),
+            Err(err) => {
+                let _ = inner.event_tx.send(EngineEvent::Warning {
+                    message: format!("warning: invalid cpu allowlist '{spec}': {err}"),
+                });
+                None
+            }
+        },
+        _ => None,
+    };
+
+    let blocklist = match cfg.cpu_core_blocklist.as_deref() {
+        Some(spec) if !spec.trim().is_empty() => match parse_core_list(spec) {
+            Ok(v) => Some(v),
+            Err(err) => {
+                let _ = inner.event_tx.send(EngineEvent::Warning {
+                    message: format!("warning: invalid cpu blocklist '{spec}': {err}"),
+                });
+                None
+            }
+        },
+        _ => None,
+    };
+
+    crate::worker::set_cpu_core_lists(allowlist, blocklist);
 
     for worker_idx in 0..cfg.parallel {
         let (tx, rx) = mpsc::channel::<WorkerCommand>(1);
@@ -649,6 +754,60 @@ crate::worker::set_cpu_core_blocklist(blocklist);
         }
     }
 
+    // Spawn GPU worker threads (minimal: 1 device, batch worker).
+    for gpu_i in 0..gpu_workers {
+        let worker_idx = cfg.parallel + gpu_i;
+        let (tx, rx) = mpsc::channel::<WorkerCommand>(1);
+        worker_cmds.push(tx);
+
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        worker_progress.push(progress.clone());
+
+        let internal_tx = internal_tx.clone();
+        let http = http.clone();
+        let submitter = submitter.clone();
+        let warned = warned_invalid_reward_address.clone();
+
+        let name = format!("bbr-gpu-worker-{}", gpu_i + 1);
+        let handle = std::thread::Builder::new().name(name).spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            let rt = match rt {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = internal_tx.send(WorkerInternalEvent::Error {
+                        message: format!(
+                            "error: failed to build worker tokio runtime (gpu worker {}): {err:#}",
+                            worker_idx + 1
+                        ),
+                    });
+                    return;
+                }
+            };
+
+            rt.block_on(async move {
+                crate::worker::run_worker_task(
+                    worker_idx,
+                    rx,
+                    internal_tx,
+                    progress,
+                    http,
+                    submitter,
+                    warned,
+                )
+                .await;
+            });
+        });
+
+        match handle {
+            Ok(h) => worker_threads.push(h),
+            Err(err) => {
+                let _ = inner.event_tx.send(EngineEvent::Warning {
+                    message: format!("warning: failed to spawn gpu worker thread {}: {err:#}", worker_idx + 1),
+                });
+            }
+        }
+    }
+
     // Load inflight leases (resume).
     let mut inflight = match InflightStore::load() {
         Ok(Some(store)) => Some(store),
@@ -660,29 +819,6 @@ crate::worker::set_cpu_core_blocklist(blocklist);
         }
     };
 
-    // Drop expired inflight leases.
-    if let Some(store) = inflight.as_mut() {
-        let now = Utc::now().timestamp();
-        let expired_job_ids: Vec<u64> = store
-            .entries()
-            .filter(|entry| entry.lease_expires_at <= now)
-            .map(|entry| entry.job.job_id)
-            .collect();
-
-        if !expired_job_ids.is_empty() {
-            for job_id in expired_job_ids {
-                store.remove_job(job_id);
-            }
-
-            if let Err(err) = store.persist().await {
-                let _ = inner.event_tx.send(EngineEvent::Warning {
-                    message: format!("warning: failed to persist expired inflight lease cleanup: {err:#}"),
-                });
-            }
-        }
-    }
-
-    // Seed pending from inflight.
     let mut pending = VecDeque::new();
     if let Some(store) = inflight.as_ref() {
         for entry in store.entries() {
@@ -702,11 +838,19 @@ crate::worker::set_cpu_core_blocklist(blocklist);
         }
     }
 
-    let workers = (0..cfg.parallel).map(|_| WorkerRuntime::new()).collect();
+    let workers = (0..total_workers).map(|_| WorkerRuntime::new()).collect();
 
     let runtime = EngineRuntime {
         http,
         cfg,
+        cpu_workers: cfg.parallel,
+        gpu_workers,
+        gpu_device_label,
+        gpu_backend_kind,
+        gpu_batch_started_at: None,
+        gpu_min_batch,
+        gpu_max_batch,
+        gpu_batch_timeout,
         workers,
         worker_cmds,
         worker_progress,
