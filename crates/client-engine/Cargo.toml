@@ -16,6 +16,9 @@ tokio = { workspace = true }
 bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
 bbr-client-core = { path = "../client-core" }
 
+# Safe CUDA runtime wrapper (contains all unsafe CUDA interaction).
+bbr-cuda-runtime = { path = "../cuda-runtime" }
+
 # CPU thread pinning helpers (Windows/Linux). macOS falls back to no pinning.
 core_affinity = "0.8"
 cfg-if = "1"
