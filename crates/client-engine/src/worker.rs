@@ -17,10 +17,10 @@ use crate::cpu_affinity::{CpuPinPolicy, pin_current_thread_with_lists};
 
 const DISCRIMINANT_BITS: usize = 1024;
 
+
 // Global, process-wide switch to enable/disable CPU thread pinning.
 //
-// The engine can toggle this (for example from EngineConfig.cpu_pin_threads)
-// by calling `set_cpu_pinning_enabled(false)` before spawning CPU workers.
+// The engine can configure this from EngineConfig.cpu_pin_threads.
 static CPU_PINNING_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // CPU pin policy toggles (process-wide). Default matches previous behaviour.
@@ -43,7 +43,7 @@ fn blocklist_cell() -> &'static RwLock<Option<Vec<usize>>> {
 
 /// Enable/disable CPU thread pinning for CPU workers.
 ///
-/// # Notes
+/// Notes:
 /// - This is process-wide and should be configured once at startup.
 /// - GPU workers are never pinned by `worker.rs`.
 pub(crate) fn set_cpu_pinning_enabled(enabled: bool) {
@@ -52,7 +52,7 @@ pub(crate) fn set_cpu_pinning_enabled(enabled: bool) {
 
 /// Configure the CPU pinning policy (process-wide).
 ///
-/// # Notes
+/// Notes:
 /// - This should be called once at startup (from the engine or CLI).
 /// - This affects only CPU workers (GPU workers are never pinned here).
 pub(crate) fn set_cpu_pin_policy(reserve_core0: bool, reversed: bool) {
@@ -148,9 +148,32 @@ pub(crate) async fn run_worker_task(
     submitter: Arc<tokio::sync::RwLock<SubmitterConfig>>,
     warned_invalid_reward_address: Arc<AtomicBool>,
 ) {
-    // We pin lazily, on first CPU job command, because the engine may also create GPU workers
-    // using the same task function. GPU workers should not be CPU-affinity pinned here.
-    let mut cpu_pinned = false;
+    // Best-effort CPU pinning.
+    // This will be fully effective once the engine runs 1 dedicated OS thread per CPU worker.
+    // On Windows/Linux, this pins the current thread. On macOS, it's a no-op.
+    match pin_current_thread(worker_idx, CpuPinPolicy::default()) {
+        Ok(Some(core_id)) => {
+            let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                message: format!(
+                    "info: cpu worker {} pinned to core {} (core 0 reserved, reverse order)",
+                    worker_idx + 1,
+                    core_id
+                ),
+            });
+        }
+        Ok(None) => {
+            // No warning needed: could be unsupported OS or no core list available.
+        }
+        Err(err) => {
+            let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                message: format!(
+                    "warning: cpu worker {} pinning failed: {}",
+                    worker_idx + 1,
+                    err
+                ),
+            });
+        }
+    }
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -163,55 +186,44 @@ pub(crate) async fn run_worker_task(
                 progress_steps,
                 job,
             } => {
-                if !cpu_pinned {
-                    cpu_pinned = true;
+if !cpu_pinned {
+    cpu_pinned = true;
 
-                    if CPU_PINNING_ENABLED.load(Ordering::SeqCst) {
-                        // Best-effort CPU pinning.
-                        // On Windows/Linux, this pins the current thread. On macOS, it's a no-op.
-                        // The default policy is expected to:
-                        // - exclude core 0
-                        // - pin in reverse core order
-                        let policy = current_cpu_pin_policy();
+    if CPU_PINNING_ENABLED.load(Ordering::SeqCst) {
+        let policy = current_cpu_pin_policy();
 
-                        // Snapshot allow/block lists (avoid holding locks across pin call).
-                        let allowlist_snapshot: Option<Vec<usize>> = allowlist_cell()
-                            .read()
-                            .ok()
-                            .and_then(|g| g.clone());
-                        let blocklist_snapshot: Option<Vec<usize>> = blocklist_cell()
-                            .read()
-                            .ok()
-                            .and_then(|g| g.clone());
+        // Snapshot allow/block lists (avoid holding locks across the pin call).
+        let allowlist_snapshot: Option<Vec<usize>> =
+            allowlist_cell().read().ok().and_then(|g| g.clone());
+        let blocklist_snapshot: Option<Vec<usize>> =
+            blocklist_cell().read().ok().and_then(|g| g.clone());
 
-                        let allow_ref = allowlist_snapshot.as_deref();
-                        let block_ref = blocklist_snapshot.as_deref();
+        let allow_ref = allowlist_snapshot.as_deref();
+        let block_ref = blocklist_snapshot.as_deref();
 
-                        match pin_current_thread_with_lists(worker_idx, policy, allow_ref, block_ref) {
-                            Ok(Some(core_id)) => {
-                                let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                                    message: format!(
-                                        "info: cpu worker {} pinned to core {} (core 0 reserved, reverse order)",
-                                        worker_idx + 1,
-                                        core_id
-                                    ),
-                                });
-                            }
-                            Ok(None) => {
-                                // No warning needed: could be unsupported OS or no core list available.
-                            }
-                            Err(err) => {
-                                let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                                    message: format!(
-                                        "warning: cpu worker {} pinning failed: {}",
-                                        worker_idx + 1,
-                                        err
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
+        match pin_current_thread_with_lists(worker_idx, policy, allow_ref, block_ref) {
+            Ok(Some(core_id)) => {
+                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                    message: format!(
+                        "info: cpu worker {} pinned to core {}",
+                        worker_idx + 1,
+                        core_id
+                    ),
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                    message: format!(
+                        "warning: cpu worker {} pinning failed: {}",
+                        worker_idx + 1,
+                        err
+                    ),
+                });
+            }
+        }
+    }
+}
 
                 let outcome = run_job(
                     worker_idx,
@@ -238,10 +250,6 @@ pub(crate) async fn run_worker_task(
                 jobs,
                 device_label,
             } => {
-                // Mark pinned as "handled" to avoid pinning in case this worker later receives CPU work.
-                // In practice the engine should not mix modes for a given worker.
-                cpu_pinned = true;
-
                 let outcomes = run_gpu_batch(
                     worker_idx,
                     &device_label,
@@ -282,7 +290,7 @@ async fn run_gpu_batch(
 ) -> Vec<JobOutcome> {
     // This is a functional stub: it executes the batch sequentially on CPU using the
     // existing chiavdf path, but keeps the orchestration "batch -> submit" semantics.
-    // The CUDA/OpenCL backends will le plug into this function next.
+    // The CUDA/OpenCL backends will plug into this function next.
 
     let _ = internal_tx.send(WorkerInternalEvent::Warning {
         message: format!(
