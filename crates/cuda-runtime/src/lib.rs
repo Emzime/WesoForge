@@ -355,15 +355,17 @@ DONE:
 }
 "#;
 
-// PTX for the actual VDF batch kernel.
+// PTX for the VDF batch kernel.
 //
 // IMPORTANT:
 // - The engine expects the output layout to be `jobs * 200 bytes`.
 // - `y` must be written to the first 100 bytes and `witness` to the next 100 bytes.
 // - The worker validates `y` against the backend-provided output before using the GPU witness.
 //
-// You can replace `src/vdf.ptx` with a real kernel PTX without touching Rust plumbing.
-const VDF_PTX: &str = include_str!("vdf.ptx");
+// Build strategy:
+// - Prefer compiling `kernels/vdf.cu` to PTX via `nvcc` (build.rs).
+// - If `nvcc` is missing, fall back to `src/vdf_fallback.ptx`.
+const VDF_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/vdf.ptx"));
 
 // PTX for a shape-correct stub proof kernel.
 //
