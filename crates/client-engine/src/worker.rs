@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -13,7 +13,7 @@ use bbr_client_core::submitter::SubmitterConfig;
 
 use crate::api::{JobOutcome, JobSummary, WorkerStage};
 use crate::backend::{BackendError, BackendJobDto, SubmitResponse, submit_job};
-use crate::cpu_affinity::{CpuPinPolicy, pin_current_thread};
+use crate::cpu_affinity::{CpuPinPolicy, pin_current_thread_with_lists};
 
 const DISCRIMINANT_BITS: usize = 1024;
 
@@ -23,6 +23,24 @@ const DISCRIMINANT_BITS: usize = 1024;
 // by calling `set_cpu_pinning_enabled(false)` before spawning CPU workers.
 static CPU_PINNING_ENABLED: AtomicBool = AtomicBool::new(true);
 
+// CPU pin policy toggles (process-wide). Default matches previous behaviour.
+// Bit 0: reserve_core0
+// Bit 1: reversed
+static CPU_PIN_POLICY_BITS: AtomicU8 = AtomicU8::new(0b11);
+
+// Optional CPU core allow/block lists configured by the user.
+// These are stored as parsed core IDs, and applied by the worker when pinning.
+static CPU_CORE_ALLOWLIST: OnceLock<RwLock<Option<Vec<usize>>>> = OnceLock::new();
+static CPU_CORE_BLOCKLIST: OnceLock<RwLock<Option<Vec<usize>>>> = OnceLock::new();
+
+fn allowlist_cell() -> &'static RwLock<Option<Vec<usize>>> {
+    CPU_CORE_ALLOWLIST.get_or_init(|| RwLock::new(None))
+}
+
+fn blocklist_cell() -> &'static RwLock<Option<Vec<usize>>> {
+    CPU_CORE_BLOCKLIST.get_or_init(|| RwLock::new(None))
+}
+
 /// Enable/disable CPU thread pinning for CPU workers.
 ///
 /// # Notes
@@ -30,6 +48,48 @@ static CPU_PINNING_ENABLED: AtomicBool = AtomicBool::new(true);
 /// - GPU workers are never pinned by `worker.rs`.
 pub(crate) fn set_cpu_pinning_enabled(enabled: bool) {
     CPU_PINNING_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+/// Configure the CPU pinning policy (process-wide).
+///
+/// # Notes
+/// - This should be called once at startup (from the engine or CLI).
+/// - This affects only CPU workers (GPU workers are never pinned here).
+pub(crate) fn set_cpu_pin_policy(reserve_core0: bool, reversed: bool) {
+    let mut bits: u8 = 0;
+    if reserve_core0 {
+        bits |= 0b01;
+    }
+    if reversed {
+        bits |= 0b10;
+    }
+    CPU_PIN_POLICY_BITS.store(bits, Ordering::SeqCst);
+}
+
+/// Set the optional CPU core allowlist (process-wide).
+///
+/// When set, only these cores are eligible for CPU workers.
+pub(crate) fn set_cpu_core_allowlist(cores: Option<Vec<usize>>) {
+    if let Ok(mut guard) = allowlist_cell().write() {
+        *guard = cores;
+    }
+}
+
+/// Set the optional CPU core blocklist (process-wide).
+///
+/// When set, these cores are excluded from CPU worker scheduling.
+pub(crate) fn set_cpu_core_blocklist(cores: Option<Vec<usize>>) {
+    if let Ok(mut guard) = blocklist_cell().write() {
+        *guard = cores;
+    }
+}
+
+fn current_cpu_pin_policy() -> CpuPinPolicy {
+    let bits = CPU_PIN_POLICY_BITS.load(Ordering::SeqCst);
+    CpuPinPolicy {
+        reserve_core0: (bits & 0b01) != 0,
+        reversed: (bits & 0b10) != 0,
+    }
 }
 
 fn default_classgroup_element() -> [u8; 100] {
@@ -95,7 +155,6 @@ pub(crate) async fn run_worker_task(
     while let Some(cmd) = rx.recv().await {
         match cmd {
             WorkerCommand::Stop => break,
-
             WorkerCommand::Job {
                 worker_idx,
                 backend_url,
@@ -113,7 +172,22 @@ pub(crate) async fn run_worker_task(
                         // The default policy is expected to:
                         // - exclude core 0
                         // - pin in reverse core order
-                        match pin_current_thread(worker_idx, CpuPinPolicy::default()) {
+                        let policy = current_cpu_pin_policy();
+
+                        // Snapshot allow/block lists (avoid holding locks across pin call).
+                        let allowlist_snapshot: Option<Vec<usize>> = allowlist_cell()
+                            .read()
+                            .ok()
+                            .and_then(|g| g.clone());
+                        let blocklist_snapshot: Option<Vec<usize>> = blocklist_cell()
+                            .read()
+                            .ok()
+                            .and_then(|g| g.clone());
+
+                        let allow_ref = allowlist_snapshot.as_deref();
+                        let block_ref = blocklist_snapshot.as_deref();
+
+                        match pin_current_thread_with_lists(worker_idx, policy, allow_ref, block_ref) {
                             Ok(Some(core_id)) => {
                                 let _ = internal_tx.send(WorkerInternalEvent::Warning {
                                     message: format!(
@@ -155,7 +229,6 @@ pub(crate) async fn run_worker_task(
                 .await;
                 let _ = internal_tx.send(WorkerInternalEvent::Finished { outcome });
             }
-
             WorkerCommand::GpuBatch {
                 worker_idx,
                 backend_url,
@@ -207,8 +280,10 @@ async fn run_gpu_batch(
     progress_steps: u64,
     jobs: Vec<BackendJobDto>,
 ) -> Vec<JobOutcome> {
-    // Functional stub: execute the batch sequentially on CPU using the existing chiavdf path.
-    // This keeps the engine <-> worker contract stable while CUDA/OpenCL is implemented.
+    // This is a functional stub: it executes the batch sequentially on CPU using the
+    // existing chiavdf path, but keeps the orchestration "batch -> submit" semantics.
+    // The CUDA/OpenCL backends will le plug into this function next.
+
     let _ = internal_tx.send(WorkerInternalEvent::Warning {
         message: format!(
             "info: gpu worker {} received batch={} on {} (CPU-stub execution)",
@@ -219,6 +294,7 @@ async fn run_gpu_batch(
     });
 
     let mut outcomes = Vec::with_capacity(jobs.len());
+
     for job in jobs {
         // Reset progress per job to keep UI consistent.
         progress.store(0, Ordering::Relaxed);
@@ -283,7 +359,6 @@ async fn run_job(
             };
         }
     };
-
     let challenge = match B64.decode(job.challenge_b64.as_bytes()) {
         Ok(v) => v,
         Err(err) => {
@@ -556,22 +631,45 @@ async fn submit_witness(
                     Some(BackendError::LeaseConflict)
                 ) {
                     let _ = internal_tx.send(WorkerInternalEvent::Error {
-                        message: format!("error: submit rejected for job {job_id}: lease conflict"),
+                        message: format!(
+                            "error: submit rejected for job {job_id}: lease conflict (already leased by someone else)"
+                        ),
                     });
                     return Err(SubmitFailure {
                         message: "Error (lease conflict)".to_string(),
                         drop_inflight: true,
                     });
                 }
-
-                if now >= lease_expires_at {
+                if matches!(
+                    err.downcast_ref::<BackendError>(),
+                    Some(BackendError::JobNotFound)
+                ) {
                     let _ = internal_tx.send(WorkerInternalEvent::Error {
-                        message: format!("error: submit aborted for job {job_id}: lease expired"),
+                        message: format!("error: submit rejected for job {job_id}: job not found"),
                     });
                     return Err(SubmitFailure {
-                        message: "Error (lease expired)".to_string(),
+                        message: "Error (job not found)".to_string(),
                         drop_inflight: true,
                     });
+                }
+                if matches!(
+                    err.downcast_ref::<BackendError>(),
+                    Some(BackendError::InvalidRewardAddress)
+                ) && reward_address.is_some()
+                {
+                    {
+                        let mut cfg = submitter.write().await;
+                        cfg.reward_address = None;
+                    }
+
+                    if !warned_invalid_reward_address.swap(true, Ordering::SeqCst) {
+                        let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                            message: "warning: backend rejected configured reward address; submitting without reward metadata"
+                                .to_string(),
+                        });
+                    }
+
+                    continue;
                 }
 
                 let err_msg = format!("{err:#}");
@@ -580,24 +678,13 @@ async fn submit_witness(
                 if should_log {
                     last_submit_err = Some(err_msg.clone());
                     last_log_at = Instant::now();
-                    let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                    let expires_in = (lease_expires_at - now).max(0);
+                    let _ = internal_tx.send(WorkerInternalEvent::Error {
                         message: format!(
-                            "warning: submit failed for job {job_id} (attempt {attempts}): {err_msg}; retrying in 5s"
+                            "error: submit failed for job {job_id} (attempt {attempts}, lease expires in {expires_in}s): {err_msg}; retrying in 5s"
                         ),
                     });
                 }
-
-                // If reward address is invalid, the backend may reject. Warn once with a friendlier hint.
-                if matches!(
-                    err.downcast_ref::<BackendError>(),
-                    Some(BackendError::InvalidRewardAddress)
-                ) && !warned_invalid_reward_address.swap(true, Ordering::SeqCst)
-                {
-                    let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                        message: "warning: backend reports invalid reward address; check your configuration".to_string(),
-                    });
-                }
-
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
