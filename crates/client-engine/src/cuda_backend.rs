@@ -73,33 +73,6 @@ mod tests {
 
     const DISCRIMINANT_BITS: usize = 1024;
 
-    /// Test iteration presets to speed up the dev loop.
-    ///
-    /// - Tiny: very fast smoke checks (CPU oracle is quick).
-    /// - Medium: still reasonable locally, catches more edge cases.
-    #[derive(Clone, Copy, Debug)]
-    enum IterMode {
-        Tiny,
-        Medium,
-    }
-
-    fn iter_mode() -> IterMode {
-        // Accepts: tiny|small|medium. Defaults to Tiny to keep CI/dev fast.
-        let v = std::env::var("WESOFORGE_TEST_ITERS").unwrap_or_else(|_| "tiny".to_string());
-        match v.to_ascii_lowercase().as_str() {
-            "medium" | "med" => IterMode::Medium,
-            "small" | "tiny" | "fast" | "" => IterMode::Tiny,
-            _ => IterMode::Tiny,
-        }
-    }
-
-    fn iters_for(mode: IterMode) -> u64 {
-        match mode {
-            IterMode::Tiny => 64,
-            IterMode::Medium => 250,
-        }
-    }
-
     fn default_x_s() -> [u8; 100] {
         // Must match worker.rs default classgroup element.
         let mut el = [0u8; 100];
@@ -119,13 +92,8 @@ mod tests {
     fn cpu_reference_y_witness(challenge: &[u8; 32], iters: u64) -> [u8; 200] {
         // Uses the fast chiavdf CPU oracle to compute y||witness (200 bytes for 1024-bit).
         let x = default_x_s();
-        let out = bbr_client_chiavdf_fast::prove_one_weso_fast(
-            challenge,
-            &x,
-            DISCRIMINANT_BITS,
-            iters,
-        )
-        .expect("cpu reference prove_one_weso_fast failed");
+        let out = bbr_client_chiavdf_fast::prove_one_weso_fast(challenge, &x, DISCRIMINANT_BITS, iters)
+            .expect("cpu reference prove_one_weso_fast failed");
         assert_eq!(
             out.len(),
             200,
@@ -146,36 +114,21 @@ mod tests {
     fn cpu_golden_inputs_are_deterministic() {
         // Golden *inputs* are deterministic by construction; this test ensures the CPU oracle
         // is deterministic for those inputs as well.
-        let mode = iter_mode();
-        let iters = iters_for(mode);
-
         let c0 = fixed_challenge(1);
         let c1 = fixed_challenge(2);
 
-        let a = cpu_reference_y_witness(&c0, iters);
-        let b = cpu_reference_y_witness(&c0, iters);
+        let a = cpu_reference_y_witness(&c0, 250);
+        let b = cpu_reference_y_witness(&c0, 250);
         assert_eq!(a, b, "CPU oracle must be deterministic for fixed inputs");
 
-        let x = cpu_reference_y_witness(&c1, iters);
+        let x = cpu_reference_y_witness(&c1, 250);
         assert_ne!(a, x, "Different challenges should yield different outputs");
     }
 
     #[test]
-    fn gpu_single_job_shape_is_correct_when_cuda_is_available() {
-        // Shape-only harness for N=1: verifies packing + kernel + unpacking returns exactly 200 bytes.
-        if !cuda_available(0) {
-            eprintln!("skipping: CUDA device 0 not available");
-            return;
-        }
-
-        let c = fixed_challenge(42);
-        let out = prove_vdf_batch(0, &c).expect("prove_vdf_batch failed");
-        assert_eq!(out.len(), 200, "output must be 200 bytes for a single job");
-    }
-
-    #[test]
     fn gpu_batch_shape_is_correct_when_cuda_is_available() {
-        // Shape-only harness for N>1: verifies packing + kernel + unpacking returns N*200 bytes.
+        // This test is intentionally shape-only. It verifies packing + kernel + unpacking returns
+        // the expected buffer length (N*200), without assuming cryptographic correctness.
         if !cuda_available(0) {
             eprintln!("skipping: CUDA device 0 not available");
             return;
@@ -193,42 +146,20 @@ mod tests {
 
     #[test]
     #[ignore = "Enable once vdf_prove implements real chiavdf (bit-for-bit parity)."]
-    fn gpu_matches_cpu_golden_vector_single_job() {
-        // Parity harness (N=1): CPU is the oracle, GPU must match exactly.
+    fn gpu_matches_cpu_golden_vectors() {
+        // This is the key parity harness: CPU is treated as the oracle, and GPU must match exactly.
+        // Keep this ignored until the CUDA kernel is cryptographically correct.
         if !cuda_available(0) {
             eprintln!("skipping: CUDA device 0 not available");
             return;
         }
 
-        let mode = iter_mode();
-        let iters = iters_for(mode);
-
-        let c = fixed_challenge(1);
-        let cpu = cpu_reference_y_witness(&c, iters);
-
-        let gpu = prove_vdf_batch(0, &c).expect("prove_vdf_batch failed");
-        assert_eq!(gpu.len(), 200);
-        assert_eq!(&gpu[..], &cpu[..], "GPU output mismatch for single-job vector");
-    }
-
-    #[test]
-    #[ignore = "Enable once vdf_prove implements real chiavdf (bit-for-bit parity)."]
-    fn gpu_matches_cpu_golden_vectors_batch() {
-        // Parity harness (N>1): CPU is the oracle, GPU must match each job exactly.
-        if !cuda_available(0) {
-            eprintln!("skipping: CUDA device 0 not available");
-            return;
-        }
-
-        let mode = iter_mode();
-        let base = iters_for(mode);
-
-        // Use a mix of tiny/medium to catch indexing errors across jobs.
-        // Keep the set small to make local runs reasonable.
+        // Keep iterations modest so the CPU oracle is fast enough for dev machines.
+        // Increase/add vectors as the CUDA implementation matures.
         let vectors = [
-            (fixed_challenge(1), base),
-            (fixed_challenge(2), base),
-            (fixed_challenge(3), base.saturating_mul(2)),
+            (fixed_challenge(1), 250u64),
+            (fixed_challenge(2), 250u64),
+            (fixed_challenge(3), 500u64),
         ];
 
         let mut packed = Vec::with_capacity(vectors.len() * 32);
@@ -247,4 +178,3 @@ mod tests {
         }
     }
 }
-
