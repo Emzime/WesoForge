@@ -151,32 +151,9 @@ pub(crate) async fn run_worker_task(
     submitter: Arc<tokio::sync::RwLock<SubmitterConfig>>,
     warned_invalid_reward_address: Arc<AtomicBool>,
 ) {
-    // Best-effort CPU pinning.
-    // This will be fully effective once the engine runs 1 dedicated OS thread per CPU worker.
-    // On Windows/Linux, this pins the current thread. On macOS, it's a no-op.
-    match pin_current_thread(worker_idx, CpuPinPolicy::default()) {
-        Ok(Some(core_id)) => {
-            let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                message: format!(
-                    "info: cpu worker {} pinned to core {} (core 0 reserved, reverse order)",
-                    worker_idx + 1,
-                    core_id
-                ),
-            });
-        }
-        Ok(None) => {
-            // No warning needed: could be unsupported OS or no core list available.
-        }
-        Err(err) => {
-            let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                message: format!(
-                    "warning: cpu worker {} pinning failed: {}",
-                    worker_idx + 1,
-                    err
-                ),
-            });
-        }
-    }
+    // CPU pinning is applied lazily the first time this task receives a CPU `Job`.
+    // GPU workers never pin threads here.
+    let mut cpu_pinned = false;
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -189,44 +166,45 @@ pub(crate) async fn run_worker_task(
                 progress_steps,
                 job,
             } => {
-if !cpu_pinned {
-    cpu_pinned = true;
+                if !cpu_pinned {
+                    cpu_pinned = true;
 
-    if CPU_PINNING_ENABLED.load(Ordering::SeqCst) {
-        let policy = current_cpu_pin_policy();
+                    if CPU_PINNING_ENABLED.load(Ordering::SeqCst) {
+                        let policy = current_cpu_pin_policy();
 
-        // Snapshot allow/block lists (avoid holding locks across the pin call).
-        let allowlist_snapshot: Option<Vec<usize>> =
-            allowlist_cell().read().ok().and_then(|g| g.clone());
-        let blocklist_snapshot: Option<Vec<usize>> =
-            blocklist_cell().read().ok().and_then(|g| g.clone());
+                        // Snapshot allow/block lists (avoid holding locks across the pin call).
+                        let allowlist_snapshot: Option<Vec<usize>> =
+                            allowlist_cell().read().ok().and_then(|g| g.clone());
+                        let blocklist_snapshot: Option<Vec<usize>> =
+                            blocklist_cell().read().ok().and_then(|g| g.clone());
 
-        let allow_ref = allowlist_snapshot.as_deref();
-        let block_ref = blocklist_snapshot.as_deref();
+                        let allow_ref = allowlist_snapshot.as_deref();
+                        let block_ref = blocklist_snapshot.as_deref();
 
-        match pin_current_thread_with_lists(worker_idx, policy, allow_ref, block_ref) {
-            Ok(Some(core_id)) => {
-                let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                    message: format!(
-                        "info: cpu worker {} pinned to core {}",
-                        worker_idx + 1,
-                        core_id
-                    ),
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                    message: format!(
-                        "warning: cpu worker {} pinning failed: {}",
-                        worker_idx + 1,
-                        err
-                    ),
-                });
-            }
-        }
-    }
-}
+                        match pin_current_thread_with_lists(worker_idx, policy, allow_ref, block_ref)
+                        {
+                            Ok(Some(core_id)) => {
+                                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                                    message: format!(
+                                        "info: cpu worker {} pinned to core {}",
+                                        worker_idx + 1,
+                                        core_id
+                                    ),
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                                    message: format!(
+                                        "warning: cpu worker {} pinning failed: {}",
+                                        worker_idx + 1,
+                                        err
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
 
                 let outcome = run_job(
                     worker_idx,
@@ -312,74 +290,52 @@ async fn run_gpu_batch(
         ),
     });
 
-    // Real GPU batch hook (scaffolding):
-    // - Pack one u32 per job (first 4 bytes of decoded challenge, little-endian).
-    // - Run CUDA add1 batch.
-    // - Unpack only for diagnostics.
+    // GPU batch semantics (current scaffolding, shape-correct):
+    // - challenge: 32 bytes
+    // - output (y): 100 bytes
+    // - witness: second half of the returned buffer
     //
-    // This validates the end-to-end pipeline: pack -> H2D -> kernel -> D2H -> unpack.
-    if device_id.backend == crate::gpu::GpuBackendKind::Cuda && !jobs.is_empty() {
-        let mut packed: Vec<u32> = Vec::with_capacity(jobs.len());
-        for job in &jobs {
-            match B64.decode(job.challenge_b64.as_bytes()) {
-                Ok(bytes) if bytes.len() >= 4 => {
-                    packed.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
-                }
-                _ => packed.push(0),
-            }
+    // Important:
+    // - We do not remove or alter the CPU path.
+    // - GPU is additive and opportunistic.
+    // - If the GPU-produced `y` does not match the expected output, we fall back to CPU witness.
+
+    let mut decoded: Vec<DecodedJob> = Vec::with_capacity(jobs.len());
+    let mut decode_failures: Vec<JobOutcome> = Vec::new();
+    for job in jobs {
+        match decode_job(worker_idx, &job) {
+            Ok(v) => decoded.push(v),
+            Err(outcome) => decode_failures.push(outcome),
+        }
+    }
+
+    let mut gpu_batch_out: Option<Vec<u8>> = None;
+    if device_id.backend == crate::gpu::GpuBackendKind::Cuda && !decoded.is_empty() {
+        let mut packed_challenges: Vec<u8> = Vec::with_capacity(decoded.len() * 32);
+        for dj in &decoded {
+            packed_challenges.extend_from_slice(&dj.challenge);
         }
 
-        match crate::cuda_backend::add1_batch(device_id.index, &packed) {
-            Ok(out) => {
-                // Lightweight guards: shape + a few samples (constant-time-ish).
-                if out.len() != packed.len() {
+        match crate::cuda_backend::prove_stub_batch(device_id.index, &packed_challenges) {
+            Ok(buf) => {
+                if buf.len() != decoded.len() * 200 {
                     let _ = internal_tx.send(WorkerInternalEvent::Warning {
                         message: format!(
-                            "warning: gpu worker {} CUDA batch shape mismatch on device {}: in={}, out={}",
+                            "warning: gpu worker {} CUDA batch size mismatch on device {}: expected {} bytes, got {} bytes",
                             worker_idx + 1,
                             device_id.index,
-                            packed.len(),
-                            out.len()
+                            decoded.len() * 200,
+                            buf.len(),
                         ),
                     });
                 } else {
-                    let sample_n = out.len().min(3);
-                    let mut ok = true;
-                    for i in 0..sample_n {
-                        if out[i] != packed[i].wrapping_add(1) {
-                            ok = false;
-                            break;
-                        }
-                    }
-
-                    if ok {
-                        let mut samples = Vec::with_capacity(sample_n);
-                        for i in 0..sample_n {
-                            samples.push(format!("{}->{}", packed[i], out[i]));
-                        }
-                        let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                            message: format!(
-                                "info: gpu worker {} CUDA batch OK on device {} (samples: {})",
-                                worker_idx + 1,
-                                device_id.index,
-                                samples.join(", ")
-                            ),
-                        });
-                    } else {
-                        let _ = internal_tx.send(WorkerInternalEvent::Warning {
-                            message: format!(
-                                "warning: gpu worker {} CUDA batch sample mismatch on device {} (falling back to CPU path for VDF)",
-                                worker_idx + 1,
-                                device_id.index
-                            ),
-                        });
-                    }
+                    gpu_batch_out = Some(buf);
                 }
             }
             Err(err) => {
                 let _ = internal_tx.send(WorkerInternalEvent::Warning {
                     message: format!(
-                        "warning: gpu worker {} CUDA batch failed on device {}: {} (continuing with CPU path)",
+                        "warning: gpu worker {} CUDA batch failed on device {}: {} (falling back to CPU for witness)",
                         worker_idx + 1,
                         device_id.index,
                         err
@@ -389,14 +345,22 @@ async fn run_gpu_batch(
         }
     }
 
-    // CPU remains the reference compute path for VDF until real VDF kernels exist.
-    let mut outcomes = Vec::with_capacity(jobs.len());
+    let mut outcomes: Vec<JobOutcome> = Vec::with_capacity(decoded.len() + decode_failures.len());
+    outcomes.extend(decode_failures);
 
-    for job in jobs {
-        // Reset progress per job to keep UI consistent.
+    for (i, dj) in decoded.into_iter().enumerate() {
         progress.store(0, Ordering::Relaxed);
+        let _ = internal_tx.send(WorkerInternalEvent::StageChanged {
+            worker_idx,
+            stage: WorkerStage::Computing,
+        });
 
-        let outcome = run_job(
+        let gpu_candidate = gpu_batch_out
+            .as_deref()
+            .and_then(|buf| buf.get(i * 200..(i + 1) * 200))
+            .map(parse_gpu_proof);
+
+        let outcome = run_job_gpu_or_cpu(
             worker_idx,
             internal_tx,
             progress.clone(),
@@ -404,10 +368,11 @@ async fn run_gpu_batch(
             submitter,
             warned_invalid_reward_address.clone(),
             backend_url.clone(),
-            lease_id.clone(),
+            &lease_id,
             lease_expires_at,
             progress_steps,
-            job,
+            dj,
+            gpu_candidate,
         )
         .await;
 
@@ -415,6 +380,288 @@ async fn run_gpu_batch(
     }
 
     outcomes
+}
+
+#[derive(Clone)]
+struct DecodedJob {
+    job: BackendJobDto,
+    challenge: [u8; 32],
+    output_y: [u8; 100],
+}
+
+fn decode_job(worker_idx: usize, job: &BackendJobDto) -> Result<DecodedJob, JobOutcome> {
+    let started_at = Instant::now();
+
+    let job_summary = JobSummary {
+        job_id: job.job_id,
+        height: job.height,
+        field_vdf: job.field_vdf,
+        number_of_iterations: job.number_of_iterations,
+    };
+
+    let output = match B64.decode(job.output_b64.as_bytes()) {
+        Ok(v) => v,
+        Err(err) => {
+            return Err(JobOutcome {
+                worker_idx,
+                job: job_summary,
+                output_mismatch: false,
+                submit_reason: None,
+                submit_detail: None,
+                drop_inflight: false,
+                error: Some(format!("Error (bad output_b64: {err:#})")),
+                compute_ms: 0,
+                submit_ms: 0,
+                total_ms: started_at.elapsed().as_millis() as u64,
+            });
+        }
+    };
+    let challenge = match B64.decode(job.challenge_b64.as_bytes()) {
+        Ok(v) => v,
+        Err(err) => {
+            return Err(JobOutcome {
+                worker_idx,
+                job: job_summary,
+                output_mismatch: false,
+                submit_reason: None,
+                submit_detail: None,
+                drop_inflight: false,
+                error: Some(format!("Error (bad challenge_b64: {err:#})")),
+                compute_ms: 0,
+                submit_ms: 0,
+                total_ms: started_at.elapsed().as_millis() as u64,
+            });
+        }
+    };
+
+    let challenge: [u8; 32] = match challenge.as_slice().try_into() {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(JobOutcome {
+                worker_idx,
+                job: job_summary,
+                output_mismatch: false,
+                submit_reason: None,
+                submit_detail: None,
+                drop_inflight: false,
+                error: Some(format!(
+                    "Error (invalid challenge length: expected 32 bytes, got {})",
+                    challenge.len()
+                )),
+                compute_ms: 0,
+                submit_ms: 0,
+                total_ms: started_at.elapsed().as_millis() as u64,
+            });
+        }
+    };
+
+    let output_y: [u8; 100] = match output.as_slice().try_into() {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(JobOutcome {
+                worker_idx,
+                job: job_summary,
+                output_mismatch: false,
+                submit_reason: None,
+                submit_detail: None,
+                drop_inflight: false,
+                error: Some(format!(
+                    "Error (invalid output length: expected 100 bytes, got {})",
+                    output.len()
+                )),
+                compute_ms: 0,
+                submit_ms: 0,
+                total_ms: started_at.elapsed().as_millis() as u64,
+            });
+        }
+    };
+
+    Ok(DecodedJob {
+        job: job.clone(),
+        challenge,
+        output_y,
+    })
+}
+
+#[derive(Clone)]
+struct GpuProofCandidate {
+    y: [u8; 100],
+    witness: [u8; 100],
+}
+
+fn parse_gpu_proof(buf: &[u8]) -> GpuProofCandidate {
+    let y: [u8; 100] = buf[0..100].try_into().unwrap_or([0u8; 100]);
+    let witness: [u8; 100] = buf[100..200].try_into().unwrap_or([0u8; 100]);
+    GpuProofCandidate { y, witness }
+}
+
+async fn run_job_gpu_or_cpu(
+    worker_idx: usize,
+    internal_tx: &mpsc::UnboundedSender<WorkerInternalEvent>,
+    progress: Arc<AtomicU64>,
+    http: &reqwest::Client,
+    submitter: &tokio::sync::RwLock<SubmitterConfig>,
+    warned_invalid_reward_address: Arc<AtomicBool>,
+    backend_url: Url,
+    lease_id: &str,
+    lease_expires_at: i64,
+    progress_steps: u64,
+    dj: DecodedJob,
+    gpu_candidate: Option<GpuProofCandidate>,
+) -> JobOutcome {
+    let started_at = Instant::now();
+
+    let job_summary = JobSummary {
+        job_id: dj.job.job_id,
+        height: dj.job.height,
+        field_vdf: dj.job.field_vdf,
+        number_of_iterations: dj.job.number_of_iterations,
+    };
+
+    let (witness, output_mismatch, compute_ms, used_gpu) = {
+        let compute_started_at = Instant::now();
+        if let Some(gpu) = gpu_candidate {
+            if gpu.y == dj.output_y {
+                progress.store(dj.job.number_of_iterations.max(1), Ordering::Relaxed);
+                (
+                    gpu.witness.to_vec(),
+                    false,
+                    compute_started_at.elapsed().as_millis() as u64,
+                    true,
+                )
+            } else {
+                // GPU output mismatch -> fall back to CPU witness.
+                let (witness, mismatch) = match compute_witness(
+                    worker_idx,
+                    internal_tx,
+                    progress.clone(),
+                    dj.job.number_of_iterations,
+                    progress_steps,
+                    dj.challenge.to_vec(),
+                    dj.output_y.to_vec(),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(status) => {
+                        return JobOutcome {
+                            worker_idx,
+                            job: job_summary,
+                            output_mismatch: false,
+                            submit_reason: None,
+                            submit_detail: None,
+                            drop_inflight: false,
+                            error: Some(status),
+                            compute_ms: compute_started_at.elapsed().as_millis() as u64,
+                            submit_ms: 0,
+                            total_ms: started_at.elapsed().as_millis() as u64,
+                        };
+                    }
+                };
+
+                (
+                    witness,
+                    mismatch,
+                    compute_started_at.elapsed().as_millis() as u64,
+                    false,
+                )
+            }
+        } else {
+            // No GPU candidate (backend not CUDA or batch failed) -> CPU witness.
+            let (witness, mismatch) = match compute_witness(
+                worker_idx,
+                internal_tx,
+                progress.clone(),
+                dj.job.number_of_iterations,
+                progress_steps,
+                dj.challenge.to_vec(),
+                dj.output_y.to_vec(),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(status) => {
+                    return JobOutcome {
+                        worker_idx,
+                        job: job_summary,
+                        output_mismatch: false,
+                        submit_reason: None,
+                        submit_detail: None,
+                        drop_inflight: false,
+                        error: Some(status),
+                        compute_ms: compute_started_at.elapsed().as_millis() as u64,
+                        submit_ms: 0,
+                        total_ms: started_at.elapsed().as_millis() as u64,
+                    };
+                }
+            };
+
+            (
+                witness,
+                mismatch,
+                compute_started_at.elapsed().as_millis() as u64,
+                false,
+            )
+        }
+    };
+
+    if used_gpu {
+        let _ = internal_tx.send(WorkerInternalEvent::Warning {
+            message: format!(
+                "info: worker {} used GPU witness for job {}",
+                worker_idx + 1,
+                dj.job.job_id
+            ),
+        });
+    }
+
+    let _ = internal_tx.send(WorkerInternalEvent::StageChanged {
+        worker_idx,
+        stage: WorkerStage::Submitting,
+    });
+
+    let submit_started_at = Instant::now();
+    let submit_res = submit_witness(
+        http,
+        submitter,
+        warned_invalid_reward_address,
+        internal_tx,
+        &backend_url,
+        dj.job.job_id,
+        lease_id,
+        lease_expires_at,
+        &witness,
+    )
+    .await;
+
+    let submit_ms = submit_started_at.elapsed().as_millis() as u64;
+
+    match submit_res {
+        Ok(res) => JobOutcome {
+            worker_idx,
+            job: job_summary,
+            output_mismatch,
+            submit_reason: Some(res.reason),
+            submit_detail: Some(res.detail),
+            drop_inflight: false,
+            error: None,
+            compute_ms,
+            submit_ms,
+            total_ms: started_at.elapsed().as_millis() as u64,
+        },
+        Err(fail) => JobOutcome {
+            worker_idx,
+            job: job_summary,
+            output_mismatch,
+            submit_reason: None,
+            submit_detail: None,
+            drop_inflight: fail.drop_inflight,
+            error: Some(fail.message),
+            compute_ms,
+            submit_ms,
+            total_ms: started_at.elapsed().as_millis() as u64,
+        },
+    }
 }
 
 
