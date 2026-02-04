@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::backend::{fetch_work, BackendJobDto, BackendWorkBatch};
 use crate::api::{
-    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot, WorkerSnapshot,
+    EngineConfig, EngineEvent, EngineHandle, JobErrorCode, JobOutcome, JobSummary, StatusSnapshot, WorkerSnapshot,
     WorkerStage,
 };
 use crate::cpu_affinity::parse_core_list;
@@ -39,10 +39,13 @@ impl EngineInner {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 struct WorkJobItem {
     lease_id: String,
     lease_expires_at: i64,
     job: BackendJobDto,
+    /// If true, this job must only be assigned to CPU workers.
+    cpu_only: bool,
 }
 
 #[derive(Debug)]
@@ -152,6 +155,9 @@ struct EngineRuntime {
     fetch_task: Option<tokio::task::JoinHandle<anyhow::Result<Vec<WorkJobItem>>>>,
     fetch_backoff: Option<Pin<Box<tokio::time::Sleep>>>,
     inflight: Option<InflightStore>,
+
+    // Track currently leased/assigned jobs so we can reroute them when needed.
+    active_jobs: HashMap<u64, WorkJobItem>,
 
     recent_jobs: VecDeque<JobOutcome>,
     snapshot_tx: watch::Sender<StatusSnapshot>,
@@ -308,9 +314,11 @@ impl EngineRuntime {
                 continue;
             }
 
-            let Some(first) = self.pending.front() else {
-                break;
-            };
+            let Some(first_pos) = self.pending.iter().position(|i| !i.cpu_only) else {
+    break;
+};
+let first = self.pending.get(first_pos).expect("pending pos valid");
+
 
             let lease_id = first.lease_id.clone();
             let lease_expires_at = first.lease_expires_at;
@@ -323,24 +331,32 @@ impl EngineRuntime {
                 .unwrap_or_else(|| self.gpu_devices.first().cloned().expect("gpu_devices non-empty"));
             let max_batch_for_worker = planned.batch_size.max(1);
 
-            let mut jobs: Vec<BackendJobDto> = Vec::new();
-            while jobs.len() < max_batch_for_worker {
-                let Some(front) = self.pending.front() else {
-                    break;
-                };
-                if front.lease_id != lease_id || front.lease_expires_at != lease_expires_at {
-                    break;
-                }
-                let item = self.pending.pop_front().expect("pending front exists");
-                jobs.push(item.job);
-            }
+            let mut items: Vec<WorkJobItem> = Vec::new();
+while items.len() < max_batch_for_worker {
+    let Some(pos) = self.pending.iter().position(|i| !i.cpu_only) else {
+        break;
+    };
+    let front = self.pending.get(pos).expect("pending pos valid");
+    if front.lease_id != lease_id || front.lease_expires_at != lease_expires_at {
+        break;
+    }
+    let item = self.pending.remove(pos).expect("pending pos valid");
+    items.push(item);
+}
 
-            if jobs.is_empty() {
-                break;
-            }
+if items.is_empty() {
+    break;
+}
 
-            // Track first job in UI snapshot for this worker.
-            let first_job = &jobs[0];
+for it in &items {
+    self.active_jobs.insert(it.job.job_id, it.clone());
+}
+
+let jobs: Vec<BackendJobDto> = items.iter().map(|it| it.job.clone()).collect();
+
+// Track first job in UI snapshot for this worker.
+let first_job = &jobs[0];
+
             let job_summary = JobSummary {
                 job_id: first_job.job_id,
                 height: first_job.height,
@@ -357,7 +373,11 @@ impl EngineRuntime {
                 .get(idx)
                 .map(|p| p.store(0, std::sync::atomic::Ordering::Relaxed));
 
-                        let device_label = planned.info.label();
+                        for it in &items_for_gpu {
+                self.active_jobs.insert(it.job.job_id, it.clone());
+            }
+
+            let device_label = planned.info.label();
             let device_id = planned.info.id();
             let _ = self.worker_cmds[idx]
                 .send(WorkerCommand::GpuBatch {
@@ -392,9 +412,18 @@ impl EngineRuntime {
                 continue;
             }
 
-            let Some(item) = self.pending.pop_front() else {
-                break;
-            };
+            // Prefer CPU-only rerouted jobs first.
+let item = if let Some(pos) = self.pending.iter().position(|i| i.cpu_only) {
+    self.pending.remove(pos).expect("pending pos valid")
+} else {
+    let Some(item) = self.pending.pop_front() else {
+        break;
+    };
+    item
+};
+
+
+            self.active_jobs.insert(item.job.job_id, item.clone());
 
             let job_summary = JobSummary {
                 job_id: item.job.job_id,
@@ -412,6 +441,8 @@ impl EngineRuntime {
                 .get(idx)
                 .map(|p| p.store(0, std::sync::atomic::Ordering::Relaxed));
 
+            self.active_jobs.insert(item.job.job_id, item.clone());
+
             let _ = self.worker_cmds[idx]
                 .send(WorkerCommand::Job {
                     worker_idx: idx,
@@ -420,6 +451,7 @@ impl EngineRuntime {
                     lease_expires_at: item.lease_expires_at,
                     progress_steps: self.cfg.progress_steps,
                     job: item.job,
+                    cpu_only: false,
                 })
                 .await;
 
@@ -454,6 +486,23 @@ impl EngineRuntime {
                     self.recent_jobs.pop_front();
                 }
                 self.recent_jobs.push_back(outcome.clone());
+
+// If GPU worker reports a structured compute failure, reroute the job to CPU workers.
+if outcome.error_code == Some(JobErrorCode::GpuComputeFailed) {
+    if let Some(mut item) = self.active_jobs.remove(&outcome.job.job_id) {
+        item.cpu_only = true;
+        self.pending.push_front(item);
+        self.emit(EngineEvent::Warning {
+            message: format!(
+                "info: rerouting job {} to CPU workers after GPU compute failure",
+                outcome.job.job_id
+            ),
+        });
+    }
+} else {
+    // Normal completion path.
+    self.active_jobs.remove(&outcome.job.job_id);
+}
 
                 self.emit(EngineEvent::FinishedJob { outcome });
             }
@@ -888,6 +937,7 @@ async fn run_engine(
         fetch_task: None,
         fetch_backoff: None,
         inflight: inflight.take(),
+        active_jobs: HashMap::new(),
         recent_jobs: VecDeque::new(),
         snapshot_tx,
         inner,
