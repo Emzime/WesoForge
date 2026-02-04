@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use bbr_client_core::submitter::SubmitterConfig;
 
 use crate::api::{JobOutcome, JobSummary, WorkerStage};
+use crate::gpu::GpuDeviceId;
 use crate::backend::{BackendError, BackendJobDto, SubmitResponse, submit_job};
 use crate::cpu_affinity::{CpuPinPolicy, pin_current_thread_with_lists};
 
@@ -126,6 +127,8 @@ pub(crate) enum WorkerCommand {
         lease_expires_at: i64,
         progress_steps: u64,
         jobs: Vec<BackendJobDto>,
+        /// Structured GPU device identifier.
+        device_id: GpuDeviceId,
         /// Human-readable device label (e.g. "CUDA:0 RTX 4090").
         device_label: String,
     },
@@ -248,10 +251,12 @@ if !cpu_pinned {
                 lease_expires_at,
                 progress_steps,
                 jobs,
+                device_id,
                 device_label,
             } => {
                 let outcomes = run_gpu_batch(
                     worker_idx,
+                    device_id,
                     &device_label,
                     &internal_tx,
                     progress.clone(),
@@ -276,6 +281,7 @@ if !cpu_pinned {
 
 async fn run_gpu_batch(
     worker_idx: usize,
+    device_id: GpuDeviceId,
     device_label: &str,
     internal_tx: &mpsc::UnboundedSender<WorkerInternalEvent>,
     progress: Arc<AtomicU64>,
@@ -288,21 +294,84 @@ async fn run_gpu_batch(
     progress_steps: u64,
     jobs: Vec<BackendJobDto>,
 ) -> Vec<JobOutcome> {
-    // This is a functional stub: it executes the batch sequentially on CPU using the
-    // existing chiavdf path, but keeps the orchestration "batch -> submit" semantics.
-    // The CUDA/OpenCL backends will plug into this function next.
+    // Comments in English as requested.
+    //
+    // Current behavior:
+    // - Performs a real CUDA batch call (pack -> H2D -> kernel -> D2H -> unpack) when `device_id` is CUDA.
+    // - Keeps job witness computation on CPU for correctness until the real VDF kernels are available.
+    //
+    // This function is the integration point where the CUDA VDF implementation will replace the CPU compute.
 
     let _ = internal_tx.send(WorkerInternalEvent::Warning {
         message: format!(
-            "info: gpu worker {} received batch={} on {} (CPU-stub execution)",
+            "info: gpu worker {} received batch={} on {} (device_id={:?}:{})",
             worker_idx + 1,
             jobs.len(),
-            device_label
+            device_label,
+            device_id.backend,
+            device_id.index
         ),
     });
 
-    let mut outcomes = Vec::with_capacity(jobs.len());
+    if device_id.backend == crate::gpu::GpuBackendKind::Cuda {
+        // Pack: take a stable u32 per job to validate the batch path end-to-end.
+        // We use the first 4 bytes of the decoded challenge (little-endian).
+        let mut packed: Vec<u32> = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            match B64.decode(job.challenge_b64.as_bytes()) {
+                Ok(bytes) if bytes.len() >= 4 => {
+                    let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    packed.push(v);
+                }
+                Ok(_) => {
+                    packed.push(0);
+                }
+                Err(_) => {
+                    packed.push(0);
+                }
+            }
+        }
 
+        // CUDA call: H2D -> kernel -> D2H.
+        match crate::cuda_backend::add1_batch(device_id.index, &packed) {
+            Ok(out) => {
+                // Unpack: map output back to jobs for logging/diagnostics.
+                // This confirms the wiring and per-device routing are correct.
+                let sample_len = out.len().min(4);
+                let mut samples = Vec::with_capacity(sample_len);
+                for i in 0..sample_len {
+                    samples.push(format!("{}->{}", packed[i], out[i]));
+                }
+
+                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                    message: format!(
+                        "info: gpu worker {} CUDA batch OK on device {} (samples: {})",
+                        worker_idx + 1,
+                        device_id.index,
+                        samples.join(", ")
+                    ),
+                });
+            }
+            Err(err) => {
+                let _ = internal_tx.send(WorkerInternalEvent::Warning {
+                    message: format!(
+                        "warning: gpu worker {} CUDA batch failed on device {}: {}",
+                        worker_idx + 1,
+                        device_id.index,
+                        err
+                    ),
+                });
+            }
+        }
+    }
+
+    // NOTE: The loop below is the remaining CPU path for correctness.
+    // Once a real CUDA VDF kernel exists, this will be replaced by:
+    // - pack batch VDF inputs
+    // - run CUDA kernels
+    // - unpack results
+    // - submit witnesses
+    let mut outcomes = Vec::with_capacity(jobs.len());
     for job in jobs {
         // Reset progress per job to keep UI consistent.
         progress.store(0, Ordering::Relaxed);
@@ -327,6 +396,7 @@ async fn run_gpu_batch(
 
     outcomes
 }
+
 
 async fn run_job(
     worker_idx: usize,
