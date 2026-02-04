@@ -134,11 +134,10 @@ struct EngineRuntime {
     // Worker topology
     cpu_workers: usize,
     gpu_workers: usize,
-    gpu_device_label: Option<String>,
+    gpu_devices: Vec<crate::gpu::GpuPlannedDevice>,
     gpu_backend_kind: Option<GpuBackendKind>,
     gpu_batch_started_at: Option<Instant>,
-    gpu_min_batch: usize,
-    gpu_max_batch: usize,
+    gpu_min_batch_global: usize,
     gpu_batch_timeout: Duration,
 
     workers: Vec<WorkerRuntime>,
@@ -300,7 +299,7 @@ impl EngineRuntime {
             .map(|t| now.duration_since(t) >= self.gpu_batch_timeout)
             .unwrap_or(false);
 
-        if self.pending.len() < self.gpu_min_batch && !timed_out {
+        if self.pending.len() < self.gpu_min_batch_global && !timed_out {
             return Ok(());
         }
 
@@ -316,8 +315,16 @@ impl EngineRuntime {
             let lease_id = first.lease_id.clone();
             let lease_expires_at = first.lease_expires_at;
 
+            let gpu_local_idx = idx.saturating_sub(self.cpu_workers);
+            let planned = self
+                .gpu_devices
+                .get(gpu_local_idx)
+                .cloned()
+                .unwrap_or_else(|| self.gpu_devices.first().cloned().expect("gpu_devices non-empty"));
+            let max_batch_for_worker = planned.batch_size.max(1);
+
             let mut jobs: Vec<BackendJobDto> = Vec::new();
-            while jobs.len() < self.gpu_max_batch {
+            while jobs.len() < max_batch_for_worker {
                 let Some(front) = self.pending.front() else {
                     break;
                 };
@@ -350,11 +357,8 @@ impl EngineRuntime {
                 .get(idx)
                 .map(|p| p.store(0, std::sync::atomic::Ordering::Relaxed));
 
-            let device_label = self
-                .gpu_device_label
-                .clone()
-                .unwrap_or_else(|| "GPU".to_string());
-
+                        let device_label = planned.info.label();
+            let device_id = planned.info.id();
             let _ = self.worker_cmds[idx]
                 .send(WorkerCommand::GpuBatch {
                     worker_idx: idx,
@@ -363,6 +367,7 @@ impl EngineRuntime {
                     lease_expires_at,
                     progress_steps: self.cfg.progress_steps,
                     jobs,
+                    device_id,
                     device_label,
                 })
                 .await;
@@ -613,9 +618,15 @@ async fn run_engine(
     // GPU plan (minimal: 1 device)
     // -----------------------------
     // Comments in English as requested.
-    let (gpu_workers, gpu_device_label, gpu_backend_kind, gpu_min_batch, gpu_max_batch, gpu_batch_timeout) = {
+    let (gpu_workers, gpu_devices, gpu_backend_kind, gpu_min_batch_global, gpu_batch_timeout) = {
         if !cfg.gpu_enabled || cfg.gpu_backend == crate::api::GpuBackend::Off {
-            (0usize, None, None, cfg.gpu_batch_min.max(1), cfg.gpu_batch_max.max(1), Duration::from_millis(cfg.gpu_batch_timeout_ms as u64))
+            (
+                0usize,
+                Vec::new(),
+                None,
+                cfg.gpu_batch_min.max(1),
+                Duration::from_millis(cfg.gpu_batch_timeout_ms as u64),
+            )
         } else {
             let (allow_cuda, allow_opencl) = match cfg.gpu_backend {
                 crate::api::GpuBackend::Auto => (true, true),
@@ -624,7 +635,7 @@ async fn run_engine(
                 crate::api::GpuBackend::Off => (false, false),
             };
 
-            let select = GpuSelectConfig {
+            let select = crate::gpu::GpuSelectConfig {
                 enabled: true,
                 allow_cuda,
                 allow_opencl,
@@ -632,7 +643,7 @@ async fn run_engine(
                 allowlist: cfg.gpu_device_allowlist.clone(),
             };
 
-            let batch_cfg = GpuBatchConfig {
+            let batch_cfg = crate::gpu::GpuBatchConfig {
                 min_batch: cfg.gpu_batch_min.max(1),
                 max_batch: cfg.gpu_batch_max.max(cfg.gpu_batch_min.max(1)),
                 vram_ratio: cfg.gpu_vram_ratio,
@@ -641,19 +652,37 @@ async fn run_engine(
             };
 
             let plan = gpu_manager::build_plan(&select, &batch_cfg);
-            if let Some(dev) = plan.devices.first() {
+            let devices = plan.devices;
+
+            if devices.is_empty() {
                 (
-                    1usize,
-                    Some(dev.info.label()),
-                    Some(dev.info.backend),
-                    dev.min_batch.max(1),
-                    dev.batch_size.max(1),
+                    0usize,
+                    Vec::new(),
+                    None,
+                    batch_cfg.min_batch.max(1),
                     Duration::from_millis(cfg.gpu_batch_timeout_ms as u64),
                 )
             } else {
-                (0usize, None, None, batch_cfg.min_batch, batch_cfg.max_batch, Duration::from_millis(cfg.gpu_batch_timeout_ms as u64))
+                let gpu_workers = devices.len();
+                let backend_kind = devices.first().map(|d| d.info.backend);
+
+                // Global minimum threshold used by the shared pending queue.
+                let min_global = devices
+                    .iter()
+                    .map(|d| d.min_batch.max(1))
+                    .min()
+                    .unwrap_or(batch_cfg.min_batch.max(1));
+
+                (
+                    gpu_workers,
+                    devices,
+                    backend_kind,
+                    min_global,
+                    Duration::from_millis(cfg.gpu_batch_timeout_ms as u64),
+                )
             }
         }
+
     };
 
     let total_workers = cfg.parallel + gpu_workers;
@@ -845,11 +874,10 @@ async fn run_engine(
         cfg,
         cpu_workers: cfg.parallel,
         gpu_workers,
-        gpu_device_label,
+        gpu_devices,
         gpu_backend_kind,
         gpu_batch_started_at: None,
-        gpu_min_batch,
-        gpu_max_batch,
+        gpu_min_batch_global,
         gpu_batch_timeout,
         workers,
         worker_cmds,
