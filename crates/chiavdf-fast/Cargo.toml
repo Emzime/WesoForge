@@ -1,0 +1,15 @@
+[package]
+name = "bbr-client-chiavdf-fast"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "bbr_client_chiavdf_fast"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[build-dependencies]
+cc = "1.2.54"
+
