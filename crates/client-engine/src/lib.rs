@@ -9,6 +9,7 @@ pub mod api;
 
 mod backend;
 mod cpu_affinity;
+mod cuda_backend;
 mod engine;
 mod inflight;
 mod worker;
