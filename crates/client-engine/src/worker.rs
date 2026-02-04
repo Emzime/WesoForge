@@ -316,7 +316,7 @@ async fn run_gpu_batch(
             packed_challenges.extend_from_slice(&dj.challenge);
         }
 
-        match crate::cuda_backend::prove_stub_batch(device_id.index, &packed_challenges) {
+        match crate::cuda_backend::prove_vdf_batch(device_id.index, &packed_challenges) {
             Ok(buf) => {
                 if buf.len() != decoded.len() * 200 {
                     let _ = internal_tx.send(WorkerInternalEvent::Warning {
