@@ -51,9 +51,29 @@ pub fn parse_core_list(spec: &str) -> Result<Vec<usize>, String> {
     Ok(out)
 }
 
+/// CPU pinning policy:
+/// - exclude logical core 0 (reserve for OS)
+/// - assign workers in reverse core order (last -> ... -> 1)
+#[derive(Debug, Clone, Copy)]
+pub struct CpuPinPolicy {
+    /// If true, core 0 is never used (unless allowlist is explicitly set).
+    pub reserve_core0: bool,
+    /// If true, cores are assigned in reverse order (last -> ... -> 1).
+    pub reversed: bool,
+}
+
+impl Default for CpuPinPolicy {
+    fn default() -> Self {
+        Self {
+            reserve_core0: true,
+            reversed: true,
+        }
+    }
+}
+
 /// Build the effective core list from system cores + policy + allow/block lists.
 ///
-/// # Notes
+/// Notes:
 /// - `allowlist` has priority: when present, only those cores are considered.
 /// - `reserve_core0` is applied only when allowlist is NOT present.
 ///   (If the user explicitly includes 0 in allowlist, we respect it.)
@@ -65,6 +85,8 @@ pub fn effective_core_ids(
 ) -> Vec<usize> {
     cfg_if! {
         if #[cfg(any(target_os = "windows", target_os = "linux"))] {
+            use std::collections::BTreeSet;
+
             let mut cores: Vec<usize> = core_affinity::get_core_ids()
                 .unwrap_or_default()
                 .into_iter()
@@ -74,14 +96,14 @@ pub fn effective_core_ids(
             cores.sort_unstable();
 
             if let Some(allow) = allowlist {
-                let allow_set: std::collections::BTreeSet<usize> = allow.iter().copied().collect();
+                let allow_set: BTreeSet<usize> = allow.iter().copied().collect();
                 cores.retain(|id| allow_set.contains(id));
             } else if policy.reserve_core0 {
                 cores.retain(|&id| id != 0);
             }
 
             if let Some(block) = blocklist {
-                let block_set: std::collections::BTreeSet<usize> = block.iter().copied().collect();
+                let block_set: BTreeSet<usize> = block.iter().copied().collect();
                 cores.retain(|id| !block_set.contains(id));
             }
 
@@ -95,26 +117,6 @@ pub fn effective_core_ids(
             let _ = allowlist;
             let _ = blocklist;
             Vec::new()
-        }
-    }
-}
-
-/// CPU pinning policy:
-/// - exclude logical core 0 (reserve for OS)
-/// - assign workers in reverse core order (last -> ... -> 1)
-#[derive(Debug, Clone, Copy)]
-pub struct CpuPinPolicy {
-    /// If true, core 0 is never used.
-    pub reserve_core0: bool,
-    /// If true, cores are assigned in reverse order (last -> ... -> 1).
-    pub reversed: bool,
-}
-
-impl Default for CpuPinPolicy {
-    fn default() -> Self {
-        Self {
-            reserve_core0: true,
-            reversed: true,
         }
     }
 }
