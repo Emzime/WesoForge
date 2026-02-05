@@ -11,7 +11,7 @@ use crate::api::{
     WorkerStage,
 };
 use crate::cpu_affinity::parse_core_list;
-use crate::gpu::{GpuBackendKind, GpuBatchConfig, GpuSelectConfig};
+use crate::gpu::{GpuBackendKind};
 use crate::gpu_manager;
 use crate::inflight::InflightStore;
 use crate::worker::{WorkerCommand, WorkerInternalEvent};
@@ -617,7 +617,7 @@ async fn run_engine(
     // GPU plan (minimal: 1 device)
     // -----------------------------
     // Comments in English as requested.
-    let (gpu_workers, gpu_devices, gpu_backend_kind, gpu_min_batch_global, gpu_batch_timeout) = {
+    let (gpu_workers, gpu_devices, _gpu_backend_kind, gpu_min_batch_global, gpu_batch_timeout) = {
         if !cfg.gpu_enabled || cfg.gpu_backend == crate::api::GpuBackend::Off {
             (
                 0usize,
@@ -651,6 +651,7 @@ async fn run_engine(
             };
 
             let plan = gpu_manager::build_plan(&select, &batch_cfg);
+            let gpu_min_batch_total = plan.min_batch_total;
             let devices = plan.devices;
 
             if devices.is_empty() {
@@ -666,11 +667,9 @@ async fn run_engine(
                 let backend_kind = devices.first().map(|d| d.info.backend);
 
                 // Global minimum threshold used by the shared pending queue.
-                let min_global = devices
-                    .iter()
-                    .map(|d| d.min_batch.max(1))
-                    .min()
-                    .unwrap_or(batch_cfg.min_batch.max(1));
+                // With multi-GPU, we want to wait until we can satisfy at least the sum of per-device
+                // minimum batches (or launch after timeout).
+                let min_global = gpu_min_batch_total.max(1);
 
                 (
                     gpu_workers,
@@ -880,7 +879,7 @@ async fn run_engine(
         cpu_workers,
         gpu_workers,
         gpu_devices,
-        gpu_backend_kind,
+        _gpu_backend_kind,
         gpu_batch_started_at: None,
         gpu_min_batch_global,
         gpu_batch_timeout,

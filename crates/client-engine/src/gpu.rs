@@ -56,16 +56,36 @@ impl GpuDeviceInfo {
     }
 
     pub(crate) fn label(&self) -> String {
-        format!(
-            "{}:{} {} ({})",
-            match self.backend {
-                GpuBackendKind::Cuda => "CUDA",
-                GpuBackendKind::Opencl => "OpenCL",
-            },
-            self.index,
-            self.name,
-            self.vendor
-        )
+        // Read memory hint fields to avoid dead-code warnings and provide better diagnostics.
+        let free = if self.vram_free_bytes > 0 {
+            Some(self.vram_free_bytes)
+        } else {
+            self.free_mem_bytes
+        };
+
+        match free {
+            Some(free) => format!(
+                "{}:{} {} ({}) free={}B",
+                match self.backend {
+                    GpuBackendKind::Cuda => "CUDA",
+                    GpuBackendKind::Opencl => "OpenCL",
+                },
+                self.index,
+                self.name,
+                self.vendor,
+                free
+            ),
+            None => format!(
+                "{}:{} {} ({})",
+                match self.backend {
+                    GpuBackendKind::Cuda => "CUDA",
+                    GpuBackendKind::Opencl => "OpenCL",
+                },
+                self.index,
+                self.name,
+                self.vendor
+            ),
+        }
     }
 }
 

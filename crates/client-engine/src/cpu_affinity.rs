@@ -121,22 +121,6 @@ pub(crate) fn effective_core_ids(
     }
 }
 
-/// Returns the list of usable core IDs according to the policy.
-///
-/// On unsupported platforms (e.g. macOS), returns an empty vector.
-pub(crate) fn usable_core_ids(policy: CpuPinPolicy) -> Vec<usize> {
-    effective_core_ids(policy, None, None)
-}
-
-/// Attempts to pin the current thread to the core assigned for `worker_idx`.
-///
-/// Returns:
-/// - Ok(Some(core_id)) when pinning was applied,
-/// - Ok(None) when pinning is not supported or no usable cores are available.
-pub(crate) fn pin_current_thread(worker_idx: usize, policy: CpuPinPolicy) -> Result<Option<usize>, String> {
-    pin_current_thread_with_lists(worker_idx, policy, None, None)
-}
-
 /// Attempts to pin the current thread to the core assigned for `worker_idx`,
 /// using optional allowlist/blocklist.
 pub(crate) fn pin_current_thread_with_lists(
@@ -175,11 +159,3 @@ pub(crate) fn pin_current_thread_with_lists(
     }
 }
 
-/// Compatibility shim used by earlier iterations of the worker plumbing.
-///
-/// The allowlist/blocklist storage lives in `worker.rs` (process-wide), so this function is a
-/// best-effort no-op here. Keeping the symbol avoids breaking builds when older call sites
-/// are present.
-pub(crate) fn set_allowlist_blocklist(_allowlist: Option<Vec<usize>>, _blocklist: Option<Vec<usize>>) {
-    // Intentionally empty.
-}

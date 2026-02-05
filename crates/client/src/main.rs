@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         // CPU core pinning policy.
         cpu_pin_threads: cli.cpu_pin_threads,
         cpu_reserve_core0: cli.cpu_reserve_core0,
-        \1
+        cpu_reverse_cores: cli.cpu_reverse_cores,
         cpu_core_allowlist: cli.cpu_cores.clone(),
         cpu_core_blocklist: cli.cpu_cores_exclude.clone(),
         // GPU orchestration (prepared for GUI).

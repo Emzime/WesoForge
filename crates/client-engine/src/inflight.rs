@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,6 @@ struct InflightFile {
 }
 
 pub(crate) struct InflightStore {
-    path: PathBuf,
     jobs_by_id: BTreeMap<u64, InflightJobEntry>,
 }
 
@@ -29,10 +28,7 @@ impl InflightStore {
     pub(crate) fn load() -> anyhow::Result<Option<Self>> {
         let path = inflight_path()?;
         if !path.exists() {
-            return Ok(Some(Self {
-                path,
-                jobs_by_id: BTreeMap::new(),
-            }));
+            return Ok(Some(Self { jobs_by_id: BTreeMap::new() }));
         }
 
         let raw = std::fs::read_to_string(&path)?;
@@ -42,34 +38,12 @@ impl InflightStore {
             jobs_by_id.insert(entry.job.job_id, entry);
         }
 
-        Ok(Some(Self { path, jobs_by_id }))
+        Ok(Some(Self { jobs_by_id }))
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = &InflightJobEntry> {
         self.jobs_by_id.values()
     }
-
-    pub(crate) fn insert_job(
-        &mut self,
-        lease_id: String,
-        lease_expires_at: i64,
-        job: BackendJobDto,
-    ) -> bool {
-        let job_id = job.job_id;
-        let lease_id_for_cmp = lease_id.clone();
-        let entry = InflightJobEntry {
-            lease_id,
-            lease_expires_at,
-            job,
-        };
-        match self.jobs_by_id.insert(job_id, entry) {
-            None => true,
-            Some(prev) => prev.lease_id != lease_id_for_cmp || prev.lease_expires_at != lease_expires_at,
-        }
-    }
-
-    pub(crate) fn remove_job(&mut self, job_id: u64) -> bool {
-        self.jobs_by_id.remove(&job_id).is_some()
     }
 
     pub(crate) async fn persist(&self) -> anyhow::Result<()> {
@@ -91,25 +65,6 @@ impl InflightStore {
     }
 }
 
-fn persist_file(path: &Path, file: &InflightFile) -> anyhow::Result<()> {
-    if file.jobs.is_empty() {
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
-        return Ok(());
-    }
-
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid inflight path: {}", path.display()))?;
-    std::fs::create_dir_all(dir)?;
-
-    let json = serde_json::to_string_pretty(file)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
-}
 
 fn xdg_state_home() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {

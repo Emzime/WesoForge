@@ -48,6 +48,10 @@ pub(crate) fn enumerate_devices(select: &GpuSelectConfig) -> Vec<GpuDeviceInfo> 
 /// - compute per-device auto batch sizes
 /// - compute min_batch_total used by engine reservations
 pub(crate) fn build_plan(select: &GpuSelectConfig, batch_cfg: &GpuBatchConfig) -> GpuPlan {
+    // Touch config fields that are not yet wired into the runtime loop.
+    let _ = batch_cfg.batch_timeout_ms;
+    let _ = batch_cfg.inflight_batches;
+    let _ = crate::gpu::GpuBackendKind::Opencl;
     let devices = enumerate_devices(select);
     if devices.is_empty() {
         return GpuPlan {
