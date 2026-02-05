@@ -617,7 +617,7 @@ async fn run_engine(
     // GPU plan (minimal: 1 device)
     // -----------------------------
     // Comments in English as requested.
-    let (gpu_workers, gpu_devices, _gpu_backend_kind, gpu_min_batch_global, gpu_batch_timeout) = {
+    let (gpu_workers, gpu_devices, gpu_backend_kind, gpu_min_batch_global, gpu_batch_timeout) = {
         if !cfg.gpu_enabled || cfg.gpu_backend == crate::api::GpuBackend::Off {
             (
                 0usize,
@@ -879,7 +879,7 @@ async fn run_engine(
         cpu_workers,
         gpu_workers,
         gpu_devices,
-        _gpu_backend_kind,
+        gpu_backend_kind,
         gpu_batch_started_at: None,
         gpu_min_batch_global,
         gpu_batch_timeout,

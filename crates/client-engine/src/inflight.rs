@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,29 +21,36 @@ struct InflightFile {
 }
 
 pub(crate) struct InflightStore {
+    path: PathBuf,
     jobs_by_id: BTreeMap<u64, InflightJobEntry>,
 }
 
 impl InflightStore {
     pub(crate) fn load() -> anyhow::Result<Option<Self>> {
         let path = inflight_path()?;
+
+        // If the file doesn't exist, we still return an empty store: resume is "enabled",
+        // there is simply nothing to restore.
         if !path.exists() {
-            return Ok(Some(Self { jobs_by_id: BTreeMap::new() }));
+            return Ok(Some(Self {
+                path,
+                jobs_by_id: BTreeMap::new(),
+            }));
         }
 
         let raw = std::fs::read_to_string(&path)?;
         let file: InflightFile = serde_json::from_str(&raw)?;
+
         let mut jobs_by_id = BTreeMap::new();
         for entry in file.jobs {
             jobs_by_id.insert(entry.job.job_id, entry);
         }
 
-        Ok(Some(Self { jobs_by_id }))
+        Ok(Some(Self { path, jobs_by_id }))
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = &InflightJobEntry> {
         self.jobs_by_id.values()
-    }
     }
 
     pub(crate) async fn persist(&self) -> anyhow::Result<()> {
@@ -53,9 +60,11 @@ impl InflightStore {
             jobs: self.jobs_by_id.values().cloned().collect(),
         };
 
+        // Write on a blocking thread because it may touch the filesystem.
         tokio::task::spawn_blocking(move || persist_file(&path, &file))
             .await
             .map_err(|err| anyhow::anyhow!("persist inflight leases: {err:#}"))??;
+
         Ok(())
     }
 
@@ -65,6 +74,37 @@ impl InflightStore {
     }
 }
 
+fn persist_file(path: &Path, file: &InflightFile) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid inflight path: no parent directory"))?;
+
+    let tmp_path = dir.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("inflight-leases.json")
+    ));
+
+    let payload = serde_json::to_vec_pretty(file)?;
+
+    // Best-effort atomic write: write to a temporary file in the same directory, then rename.
+    std::fs::write(&tmp_path, payload)?;
+
+    // On Windows, rename fails if the destination exists.
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+
+    Ok(())
+}
 
 fn xdg_state_home() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {

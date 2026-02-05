@@ -152,7 +152,7 @@ pub(crate) enum WorkerInternalEvent {
 }
 
 pub(crate) async fn run_worker_task(
-    worker_idx: usize,
+    _worker_idx: usize,
     mut rx: mpsc::Receiver<WorkerCommand>,
     internal_tx: mpsc::UnboundedSender<WorkerInternalEvent>,
     progress: Arc<AtomicU64>,

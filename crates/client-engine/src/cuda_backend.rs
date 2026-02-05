@@ -8,24 +8,21 @@
 //! This module is intentionally small and safe: all `unsafe` CUDA interaction is contained
 //! in the `bbr-cuda-runtime` crate.
 
-use anyhow::Context as _;
-
-use crate::gpu::{GpuBackendKind, GpuDeviceInfo};
-
 /// Enumerate CUDA devices using the CUDA runtime.
 ///
 /// This is best-effort: if CUDA is not available, it returns an empty list.
-pub(crate) fn enumerate_cuda_devices() -> Vec<GpuDeviceInfo> {
+pub(crate) fn enumerate_cuda_devices() -> Vec<crate::gpu::GpuDeviceInfo> {
     let count = match bbr_cuda_runtime::cuda_device_count() {
         Ok(n) => n,
         Err(_) => return Vec::new(),
     };
 
-    let mut out: Vec<GpuDeviceInfo> = Vec::with_capacity(count);
+    let mut out: Vec<crate::gpu::GpuDeviceInfo> = Vec::with_capacity(count);
     for index in 0..count {
-        let name = bbr_cuda_runtime::cuda_device_name(index).unwrap_or_else(|_| "Unknown CUDA GPU".to_string());
-        out.push(GpuDeviceInfo {
-            backend: GpuBackendKind::Cuda,
+        let name = bbr_cuda_runtime::cuda_device_name(index)
+            .unwrap_or_else(|_| "Unknown CUDA GPU".to_string());
+        out.push(crate::gpu::GpuDeviceInfo {
+            backend: crate::gpu::GpuBackendKind::Cuda,
             index,
             name,
             vendor: "NVIDIA".to_string(),
@@ -38,7 +35,6 @@ pub(crate) fn enumerate_cuda_devices() -> Vec<GpuDeviceInfo> {
     out
 }
 
-
 /// Execute a CUDA VDF prove batch (scaffolding).
 ///
 /// Input is a packed list of challenges, each 32 bytes:
@@ -49,8 +45,7 @@ pub(crate) fn enumerate_cuda_devices() -> Vec<GpuDeviceInfo> {
 /// - witness: 100 bytes
 ///
 /// Note: This is currently a placeholder implementation to keep the batch pipeline shape-correct.
-/// Until real CUDA VDF kernels are wired, it returns zero-filled outputs. The engine will
-/// detect mismatches and fall back to CPU witness computation.
+/// Until real CUDA VDF kernels are wired, it returns zero-filled outputs.
 pub(crate) fn prove_vdf_batch(device_index: usize, challenges: &[u8]) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
         challenges.len() % 32 == 0,
@@ -59,9 +54,6 @@ pub(crate) fn prove_vdf_batch(device_index: usize, challenges: &[u8]) -> anyhow:
     );
 
     let jobs = challenges.len() / 32;
-
-    // Keep the output shape stable (200 bytes per job). The worker validates the length.
-    // Using a deterministic placeholder makes debugging easier.
     let out = vec![0u8; jobs * 200];
 
     // Touch device_index so the signature remains future-proof and avoids unused warnings.
