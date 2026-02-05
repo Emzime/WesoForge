@@ -7,7 +7,6 @@
 // The public API is safe.
 
 use anyhow::Context as _;
-
 use cust::prelude::*;
 
 fn create_context(device_index: usize) -> anyhow::Result<Context> {
@@ -38,7 +37,8 @@ pub fn add1_smoketest(device_index: usize, n: usize) -> anyhow::Result<()> {
 
     let _ctx = create_context(device_index)?;
 
-    let module = unsafe { Module::from_ptx(ADD1_PTX, &[]) }.context("failed to load PTX module")?;
+    // Module::from_ptx is safe in cust 0.3.x (no need for `unsafe`).
+    let module = Module::from_ptx(ADD1_PTX, &[]).context("failed to load PTX module")?;
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None).context("failed to create stream")?;
 
     let n = n.max(1);
@@ -48,8 +48,12 @@ pub fn add1_smoketest(device_index: usize, n: usize) -> anyhow::Result<()> {
     let mut output: Vec<u32> = vec![0; input.len()];
 
     let in_dev = DeviceBuffer::from_slice(&input).context("failed to allocate input buffer")?;
-    let mut out_dev: DeviceBuffer<u32> =
-        DeviceBuffer::uninitialized(input.len()).context("failed to allocate output buffer")?;
+
+    // DeviceBuffer::uninitialized is unsafe: the device memory is uninitialized.
+    // Safety: the kernel writes every element of `out_dev` before we copy it back to host.
+    let out_dev: DeviceBuffer<u32> = unsafe {
+        DeviceBuffer::uninitialized(input.len()).context("failed to allocate output buffer")?
+    };
 
     // Launch config: 256 threads per block.
     let threads_per_block: u32 = 256;
@@ -96,7 +100,7 @@ pub fn add1_execute(device_index: usize, input: &[u32]) -> anyhow::Result<Vec<u3
 
     let _ctx = create_context(device_index)?;
 
-    let module = unsafe { Module::from_ptx(ADD1_PTX, &[]) }.context("failed to load PTX module")?;
+    let module = Module::from_ptx(ADD1_PTX, &[]).context("failed to load PTX module")?;
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None).context("failed to create stream")?;
 
     // If input is empty, keep the path uniform: run on a single dummy element.
@@ -106,8 +110,11 @@ pub fn add1_execute(device_index: usize, input: &[u32]) -> anyhow::Result<Vec<u3
     let n_u32: u32 = u32::try_from(host_in.len()).context("input too large for u32")?;
 
     let in_dev = DeviceBuffer::from_slice(&host_in).context("failed to allocate input buffer")?;
-    let mut out_dev: DeviceBuffer<u32> =
-        DeviceBuffer::uninitialized(host_in.len()).context("failed to allocate output buffer")?;
+
+    // Safety: the kernel writes every element of `out_dev` before the D2H copy.
+    let out_dev: DeviceBuffer<u32> = unsafe {
+        DeviceBuffer::uninitialized(host_in.len()).context("failed to allocate output buffer")?
+    };
 
     let threads_per_block: u32 = 256;
     let blocks: u32 = (n_u32 + threads_per_block - 1) / threads_per_block;
@@ -157,38 +164,34 @@ pub fn prove_stub_execute(
 ) -> anyhow::Result<Vec<u32>> {
     init_cuda().context("CUDA init")?;
 
-    let expected_words = jobs
-        .checked_mul(8)
-        .context("jobs overflow")?;
+    let expected_words = jobs.checked_mul(8).context("jobs overflow")?;
     anyhow::ensure!(
         challenges_words.len() == expected_words,
         "invalid challenges_words length: expected {expected_words}, got {}",
         challenges_words.len()
     );
 
-    let _ctx = create_context(device_index)?;
-
-    let module = unsafe { Module::from_ptx(PROVE_STUB_PTX, &[]) }
-        .context("failed to load PTX module")?;
-    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
-        .context("failed to create stream")?;
-
-    let total_out_words = jobs
-        .checked_mul(50)
-        .context("jobs overflow")?;
-
     // Uniform handling: if jobs == 0, return empty.
     if jobs == 0 {
         return Ok(Vec::new());
     }
 
+    let _ctx = create_context(device_index)?;
+
+    let module = Module::from_ptx(PROVE_STUB_PTX, &[]).context("failed to load PTX module")?;
+    let stream = Stream::new(StreamFlags::NON_BLOCKING, None).context("failed to create stream")?;
+
+    let total_out_words = jobs.checked_mul(50).context("jobs overflow")?;
+
     let jobs_u32: u32 = u32::try_from(jobs).context("jobs too large for u32")?;
     let n_u32: u32 = u32::try_from(total_out_words).context("output too large for u32")?;
 
-    let in_dev = DeviceBuffer::from_slice(challenges_words)
-        .context("failed to allocate input buffer")?;
-    let mut out_dev: DeviceBuffer<u32> = DeviceBuffer::uninitialized(total_out_words)
-        .context("failed to allocate output buffer")?;
+    let in_dev = DeviceBuffer::from_slice(challenges_words).context("failed to allocate input buffer")?;
+
+    // Safety: the kernel writes every element of the output buffer.
+    let out_dev: DeviceBuffer<u32> = unsafe {
+        DeviceBuffer::uninitialized(total_out_words).context("failed to allocate output buffer")?
+    };
 
     let threads_per_block: u32 = 256;
     let blocks: u32 = (n_u32 + threads_per_block - 1) / threads_per_block;
@@ -253,19 +256,19 @@ pub fn prove_vdf_execute(
 
     let _ctx = create_context(device_index)?;
 
-    let module = unsafe { Module::from_ptx(VDF_PTX, &[]) }
-        .context("failed to load VDF PTX module")?;
-    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
-        .context("failed to create stream")?;
+    let module = Module::from_ptx(VDF_PTX, &[]).context("failed to load VDF PTX module")?;
+    let stream = Stream::new(StreamFlags::NON_BLOCKING, None).context("failed to create stream")?;
 
     let total_out_words = jobs.checked_mul(50).context("jobs overflow")?;
     let jobs_u32: u32 = u32::try_from(jobs).context("jobs too large for u32")?;
     let n_u32: u32 = u32::try_from(total_out_words).context("output too large for u32")?;
 
-    let in_dev = DeviceBuffer::from_slice(challenges_words)
-        .context("failed to allocate input buffer")?;
-    let mut out_dev: DeviceBuffer<u32> = DeviceBuffer::uninitialized(total_out_words)
-        .context("failed to allocate output buffer")?;
+    let in_dev = DeviceBuffer::from_slice(challenges_words).context("failed to allocate input buffer")?;
+
+    // Safety: the kernel writes every element of the output buffer.
+    let out_dev: DeviceBuffer<u32> = unsafe {
+        DeviceBuffer::uninitialized(total_out_words).context("failed to allocate output buffer")?
+    };
 
     let threads_per_block: u32 = 256;
     let blocks: u32 = (n_u32 + threads_per_block - 1) / threads_per_block;
@@ -359,20 +362,6 @@ DONE:
 const VDF_PTX: &str = include_str!("vdf.ptx");
 
 // PTX for a shape-correct stub proof kernel.
-//
-// Kernel signature:
-//   extern "C" __global__ void prove_stub(const unsigned int* challenges, unsigned int* out, unsigned int jobs)
-//
-// Layout:
-// - challenges: jobs * 8 u32 words
-// - out: jobs * 50 u32 words
-//
-// For each job:
-// - out[job*50 + lane] where lane in [0,49]
-//   - lane < 8:           challenges[job*8 + lane] + 1
-//   - 8 <= lane < 25:     (job << 16) ^ lane
-//   - 25 <= lane < 33:    challenges[job*8 + (lane-25)] + 2
-//   - 33 <= lane < 50:    (job << 16) ^ lane ^ 0xA5A5
 const PROVE_STUB_PTX: &str = r#"
 .version 6.0
 .target sm_30
@@ -392,40 +381,31 @@ const PROVE_STUB_PTX: &str = r#"
     ld.param.u64 %rd2, [out_ptr];
     ld.param.u32 %r1,  [jobs];
 
-    // idx = blockIdx.x * blockDim.x + threadIdx.x
     mov.u32 %r2, %ctaid.x;
     mov.u32 %r3, %ntid.x;
     mov.u32 %r4, %tid.x;
     mad.lo.s32 %r5, %r2, %r3, %r4;
 
-    // total = jobs * 50
     mul.lo.u32 %r6, %r1, 50;
 
     setp.ge.u32 %p1, %r5, %r6;
     @%p1 bra DONE;
 
-    // job = idx / 50
     div.u32 %r7, %r5, 50;
-    // lane = idx - job*50
     mad.lo.s32 %r8, %r7, -50, %r5;
 
-    // out_index_bytes = idx * 4
     mul.wide.u32 %rd3, %r5, 4;
     add.u64 %rd4, %rd2, %rd3;
 
-    // Case lane < 8
     setp.lt.u32 %p2, %r8, 8;
     @%p2 bra LANE_LT_8;
 
-    // Case lane < 25
     setp.lt.u32 %p3, %r8, 25;
     @%p3 bra LANE_LT_25;
 
-    // Case lane < 33
     setp.lt.u32 %p4, %r8, 33;
     @%p4 bra LANE_LT_33;
 
-    // Default: lane in [33,49]
     shl.b32 %r9, %r7, 16;
     xor.b32 %r10, %r9, %r8;
     xor.b32 %r10, %r10, 0xA5A5;
@@ -433,7 +413,6 @@ const PROVE_STUB_PTX: &str = r#"
     bra DONE;
 
 LANE_LT_8:
-    // in_index = job*8 + lane
     mad.lo.s32 %r11, %r7, 8, %r8;
     mul.wide.u32 %rd5, %r11, 4;
     add.u64 %rd6, %rd1, %rd5;
@@ -449,7 +428,6 @@ LANE_LT_25:
     bra DONE;
 
 LANE_LT_33:
-    // in_index = job*8 + (lane-25)
     add.u32 %r13, %r8, -25;
     mad.lo.s32 %r11, %r7, 8, %r13;
     mul.wide.u32 %rd5, %r11, 4;
@@ -463,4 +441,3 @@ DONE:
     ret;
 }
 "#;
-
