@@ -4,7 +4,7 @@ use std::fmt;
 
 /// GPU backend selection used by the engine at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GpuBackendKind {
+pub(crate) enum GpuBackendKind {
     Cuda,
     Opencl,
 }
@@ -13,13 +13,13 @@ pub enum GpuBackendKind {
 ///
 /// This is used across the engine/worker boundary to ensure stable routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GpuDeviceId {
-    pub backend: GpuBackendKind,
-    pub index: usize,
+pub(crate) struct GpuDeviceId {
+    pub(crate) backend: GpuBackendKind,
+    pub(crate) index: usize,
 }
 
 impl GpuDeviceId {
-    pub fn new(backend: GpuBackendKind, index: usize) -> Self {
+    pub(crate) fn new(backend: GpuBackendKind, index: usize) -> Self {
         Self { backend, index }
     }
 }
@@ -27,35 +27,35 @@ impl GpuDeviceId {
 /// Basic device identification + sizing hints.
 /// This is intentionally lightweight and backend-agnostic.
 #[derive(Debug, Clone)]
-pub struct GpuDeviceInfo {
+pub(crate) struct GpuDeviceInfo {
     /// Backend kind (CUDA or OpenCL).
-    pub backend: GpuBackendKind,
+    pub(crate) backend: GpuBackendKind,
     /// Stable index within that backend enumeration (0..N).
-    pub index: usize,
+    pub(crate) index: usize,
     /// Human-readable name (e.g. "RTX 4090", "RX 7900 XTX").
-    pub name: String,
+    pub(crate) name: String,
     /// Vendor string (e.g. "NVIDIA", "AMD") if known.
-    pub vendor: String,
+    pub(crate) vendor: String,
 
     /// Total memory in bytes if known.
     ///
     /// This field exists to keep compatibility with earlier iterations of the GPU plumbing.
-    pub total_mem_bytes: Option<u64>,
+    pub(crate) total_mem_bytes: Option<u64>,
     /// Free memory in bytes if known.
-    pub free_mem_bytes: Option<u64>,
+    pub(crate) free_mem_bytes: Option<u64>,
 
     /// Total VRAM in bytes if known (0 if unknown).
-    pub vram_total_bytes: u64,
+    pub(crate) vram_total_bytes: u64,
     /// Free VRAM in bytes if known (0 if unknown).
-    pub vram_free_bytes: u64,
+    pub(crate) vram_free_bytes: u64,
 }
 
 impl GpuDeviceInfo {
-    pub fn id(&self) -> GpuDeviceId {
+    pub(crate) fn id(&self) -> GpuDeviceId {
         GpuDeviceId::new(self.backend, self.index)
     }
 
-    pub fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         format!(
             "{}:{} {} ({})",
             match self.backend {
@@ -74,7 +74,7 @@ impl GpuDeviceInfo {
 /// Supported tokens:
 /// - numeric index: "0", "1" (matches device index within backend)
 /// - substring: matched case-insensitively against label/name/vendor
-pub fn allowlist_matches(dev: &GpuDeviceInfo, token: &str) -> bool {
+pub(crate) fn allowlist_matches(dev: &GpuDeviceInfo, token: &str) -> bool {
     let t = token.trim();
     if t.is_empty() {
         return false;
@@ -94,55 +94,55 @@ pub fn allowlist_matches(dev: &GpuDeviceInfo, token: &str) -> bool {
 
 /// Device selection configuration derived from EngineConfig.
 #[derive(Debug, Clone)]
-pub struct GpuSelectConfig {
+pub(crate) struct GpuSelectConfig {
     /// Whether GPU is enabled at all.
     pub enabled: bool,
     /// Backend strategy (Auto/Cuda/Opencl/Off) is handled outside;
     /// here we only receive the already-resolved allowed backends.
-    pub allow_cuda: bool,
-    pub allow_opencl: bool,
+    pub(crate) allow_cuda: bool,
+    pub(crate) allow_opencl: bool,
 
     /// Use at most this many devices across all backends.
-    pub max_devices: Option<usize>,
+    pub(crate) max_devices: Option<usize>,
 
     /// Allowlist items:
     /// - numeric indexes: "0","1"
     /// - substrings matched against device label/name/vendor (case-insensitive)
-    pub allowlist: Vec<String>,
+    pub(crate) allowlist: Vec<String>,
 }
 
 /// Batch sizing config used by the auto-tuner.
 #[derive(Debug, Clone)]
-pub struct GpuBatchConfig {
+pub(crate) struct GpuBatchConfig {
     /// Minimum batch size per launch (per device).
-    pub min_batch: usize,
+    pub(crate) min_batch: usize,
     /// Maximum batch size per launch (per device).
-    pub max_batch: usize,
+    pub(crate) max_batch: usize,
     /// VRAM usage ratio (0..=0.95) used for auto sizing.
-    pub vram_ratio: f32,
+    pub(crate) vram_ratio: f32,
     /// Batch builder timeout in ms (engine uses this).
-    pub batch_timeout_ms: u32,
+    pub(crate) batch_timeout_ms: u32,
     /// Pipelining: max in-flight batches per device (engine uses this).
-    pub inflight_batches: usize,
+    pub(crate) inflight_batches: usize,
 }
 
 /// Result of device selection + computed batch sizes.
 #[derive(Debug, Clone)]
-pub struct GpuPlan {
+pub(crate) struct GpuPlan {
     /// Active devices.
-    pub devices: Vec<GpuPlannedDevice>,
+    pub(crate) devices: Vec<GpuPlannedDevice>,
     /// Total minimum batch across all active devices (used by engine reservations).
-    pub min_batch_total: usize,
+    pub(crate) min_batch_total: usize,
 }
 
 /// A selected device with computed batch sizing.
 #[derive(Debug, Clone)]
-pub struct GpuPlannedDevice {
-    pub info: GpuDeviceInfo,
+pub(crate) struct GpuPlannedDevice {
+    pub(crate) info: GpuDeviceInfo,
     /// Auto computed batch size for this device (clamped).
-    pub batch_size: usize,
+    pub(crate) batch_size: usize,
     /// Min batch for this device (clamped).
-    pub min_batch: usize,
+    pub(crate) min_batch: usize,
 }
 
 impl fmt::Display for GpuPlannedDevice {
@@ -164,7 +164,7 @@ impl fmt::Display for GpuPlannedDevice {
 /// - output (y): 100 bytes
 /// - witness: 100 bytes
 /// - plus overhead/alignment
-pub fn estimate_bytes_per_job() -> u64 {
+pub(crate) fn estimate_bytes_per_job() -> u64 {
     32 + 100 + 100 + 128
 }
 
@@ -172,7 +172,7 @@ pub fn estimate_bytes_per_job() -> u64 {
 ///
 /// This is intentionally conservative until the real GPU kernels and precise memory
 /// accounting are in place.
-pub fn auto_batch_size_for_device(
+pub(crate) fn auto_batch_size_for_device(
     dev: &GpuDeviceInfo,
     cfg: &GpuBatchConfig,
     bytes_per_job: u64,

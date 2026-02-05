@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::backend::{fetch_work, BackendJobDto, BackendWorkBatch};
@@ -12,7 +11,7 @@ use crate::api::{
     WorkerStage,
 };
 use crate::cpu_affinity::parse_core_list;
-use crate::gpu::GpuBackendKind;
+use crate::gpu::{GpuBackendKind, GpuBatchConfig, GpuSelectConfig};
 use crate::gpu_manager;
 use crate::inflight::InflightStore;
 use crate::worker::{WorkerCommand, WorkerInternalEvent};
@@ -202,8 +201,12 @@ impl EngineRuntime {
     fn update_speeds_and_emit(&mut self) {
         let mut any_progress = false;
         let mut sum_speed: u64 = 0;
+        let mut busy: usize = 0;
 
         for (idx, w) in self.workers.iter_mut().enumerate() {
+            if !w.is_idle() {
+                busy = busy.saturating_add(1);
+            }
             let iters_done = self
                 .worker_progress
                 .get(idx)
@@ -218,13 +221,7 @@ impl EngineRuntime {
 
         if any_progress && sum_speed != self.last_speed_emitted {
             self.last_speed_emitted = sum_speed;
-            let total = self.workers.len();
-            let busy = total.saturating_sub(self.idle_count());
-            self.emit(EngineEvent::Speed {
-                iters_per_sec: sum_speed,
-                busy,
-                total,
-            });
+            self.emit(EngineEvent::Speed { iters_per_sec: sum_speed, busy, total: self.workers.len() });
         }
     }
 
@@ -428,7 +425,7 @@ impl EngineRuntime {
                 })
                 .await;
 
-            self.emit(EngineEvent::StartedJob {
+            self.emit(EngineEvent::WorkerJobStarted {
                 worker_idx: idx,
                 job: job_summary,
             });
@@ -460,7 +457,7 @@ impl EngineRuntime {
                 }
                 self.recent_jobs.push_back(outcome.clone());
 
-                self.emit(EngineEvent::FinishedJob { outcome });
+                self.emit(EngineEvent::JobFinished { outcome });
             }
             WorkerInternalEvent::Warning { message } => {
                 self.emit(EngineEvent::Warning { message });
@@ -473,7 +470,7 @@ impl EngineRuntime {
 
     async fn shutdown_workers(&mut self) {
         for tx in &self.worker_cmds {
-            let _ = tx.send(WorkerCommand::Shutdown).await;
+            let _ = tx.send(WorkerCommand::Stop).await;
         }
 
         for h in self.worker_threads.drain(..) {
@@ -612,9 +609,6 @@ async fn run_engine(
     // Spawn CPU worker threads (each owns its own current-thread Tokio runtime).
     let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
 
-    let mut worker_cmds = Vec::with_capacity(total_workers);
-    let mut worker_progress = Vec::with_capacity(total_workers);
-    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(total_workers);
 
     let submitter = Arc::new(tokio::sync::RwLock::new(cfg.submitter.clone()));
     let warned_invalid_reward_address = Arc::new(AtomicBool::new(false));
@@ -690,7 +684,13 @@ async fn run_engine(
 
     };
 
-    let total_workers = cfg.parallel + gpu_workers;
+    let cpu_workers = cfg.parallel;
+    let total_workers = cpu_workers + gpu_workers;
+
+
+    let mut worker_cmds: Vec<mpsc::Sender<WorkerCommand>> = Vec::with_capacity(total_workers);
+    let mut worker_progress: Vec<Arc<std::sync::atomic::AtomicU64>> = Vec::with_capacity(total_workers);
+    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(total_workers);
 
     // ----------------------------------------
     // CPU pinning configuration (process-wide)
@@ -873,9 +873,6 @@ async fn run_engine(
     }
 
     let workers = (0..total_workers).map(|_| WorkerRuntime::new()).collect();
-
-    // Keep a copy of the CPU worker count before moving `cfg` into the runtime.
-    let cpu_workers = cfg.parallel;
 
     let runtime = EngineRuntime {
         http,

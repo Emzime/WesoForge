@@ -12,7 +12,7 @@ use crate::gpu::{
 /// - OpenCL is still a stub (will be implemented later).
 ///
 /// This keeps engine orchestration stable while the actual compute backends evolve.
-pub fn enumerate_devices(select: &GpuSelectConfig) -> Vec<GpuDeviceInfo> {
+pub(crate) fn enumerate_devices(select: &GpuSelectConfig) -> Vec<GpuDeviceInfo> {
     if !select.enabled {
         return Vec::new();
     }
@@ -47,7 +47,7 @@ pub fn enumerate_devices(select: &GpuSelectConfig) -> Vec<GpuDeviceInfo> {
 /// - select devices according to config
 /// - compute per-device auto batch sizes
 /// - compute min_batch_total used by engine reservations
-pub fn build_plan(select: &GpuSelectConfig, batch_cfg: &GpuBatchConfig) -> GpuPlan {
+pub(crate) fn build_plan(select: &GpuSelectConfig, batch_cfg: &GpuBatchConfig) -> GpuPlan {
     let devices = enumerate_devices(select);
     if devices.is_empty() {
         return GpuPlan {

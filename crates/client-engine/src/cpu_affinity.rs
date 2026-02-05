@@ -10,7 +10,7 @@ use cfg_if::cfg_if;
 /// - "2,3,10-15" (mixed)
 ///
 /// Returns a sorted, de-duplicated list of core IDs.
-pub fn parse_core_list(spec: &str) -> Result<Vec<usize>, String> {
+pub(crate) fn parse_core_list(spec: &str) -> Result<Vec<usize>, String> {
     let s = spec.trim();
     if s.is_empty() {
         return Err("core list must not be empty".to_string());
@@ -55,7 +55,7 @@ pub fn parse_core_list(spec: &str) -> Result<Vec<usize>, String> {
 /// - exclude logical core 0 (reserve for OS)
 /// - assign workers in reverse core order (last -> ... -> 1)
 #[derive(Debug, Clone, Copy)]
-pub struct CpuPinPolicy {
+pub(crate) struct CpuPinPolicy {
     /// If true, core 0 is never used (unless allowlist is explicitly set).
     pub reserve_core0: bool,
     /// If true, cores are assigned in reverse order (last -> ... -> 1).
@@ -78,7 +78,7 @@ impl Default for CpuPinPolicy {
 /// - `reserve_core0` is applied only when allowlist is NOT present.
 ///   (If the user explicitly includes 0 in allowlist, we respect it.)
 /// - `blocklist` is always applied as a final filter.
-pub fn effective_core_ids(
+pub(crate) fn effective_core_ids(
     policy: CpuPinPolicy,
     allowlist: Option<&[usize]>,
     blocklist: Option<&[usize]>,
@@ -124,7 +124,7 @@ pub fn effective_core_ids(
 /// Returns the list of usable core IDs according to the policy.
 ///
 /// On unsupported platforms (e.g. macOS), returns an empty vector.
-pub fn usable_core_ids(policy: CpuPinPolicy) -> Vec<usize> {
+pub(crate) fn usable_core_ids(policy: CpuPinPolicy) -> Vec<usize> {
     effective_core_ids(policy, None, None)
 }
 
@@ -133,13 +133,13 @@ pub fn usable_core_ids(policy: CpuPinPolicy) -> Vec<usize> {
 /// Returns:
 /// - Ok(Some(core_id)) when pinning was applied,
 /// - Ok(None) when pinning is not supported or no usable cores are available.
-pub fn pin_current_thread(worker_idx: usize, policy: CpuPinPolicy) -> Result<Option<usize>, String> {
+pub(crate) fn pin_current_thread(worker_idx: usize, policy: CpuPinPolicy) -> Result<Option<usize>, String> {
     pin_current_thread_with_lists(worker_idx, policy, None, None)
 }
 
 /// Attempts to pin the current thread to the core assigned for `worker_idx`,
 /// using optional allowlist/blocklist.
-pub fn pin_current_thread_with_lists(
+pub(crate) fn pin_current_thread_with_lists(
     worker_idx: usize,
     policy: CpuPinPolicy,
     allowlist: Option<&[usize]>,
@@ -180,6 +180,6 @@ pub fn pin_current_thread_with_lists(
 /// The allowlist/blocklist storage lives in `worker.rs` (process-wide), so this function is a
 /// best-effort no-op here. Keeping the symbol avoids breaking builds when older call sites
 /// are present.
-pub fn set_allowlist_blocklist(_allowlist: Option<Vec<usize>>, _blocklist: Option<Vec<usize>>) {
+pub(crate) fn set_allowlist_blocklist(_allowlist: Option<Vec<usize>>, _blocklist: Option<Vec<usize>>) {
     // Intentionally empty.
 }
