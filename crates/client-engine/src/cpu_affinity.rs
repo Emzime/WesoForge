@@ -174,3 +174,12 @@ pub fn pin_current_thread_with_lists(
         }
     }
 }
+
+/// Compatibility shim used by earlier iterations of the worker plumbing.
+///
+/// The allowlist/blocklist storage lives in `worker.rs` (process-wide), so this function is a
+/// best-effort no-op here. Keeping the symbol avoids breaking builds when older call sites
+/// are present.
+pub fn set_allowlist_blocklist(_allowlist: Option<Vec<usize>>, _blocklist: Option<Vec<usize>>) {
+    // Intentionally empty.
+}

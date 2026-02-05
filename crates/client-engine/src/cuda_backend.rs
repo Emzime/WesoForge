@@ -12,6 +12,31 @@ use anyhow::Context as _;
 
 use crate::gpu::{GpuBackendKind, GpuDeviceInfo};
 
+/// Enumerate CUDA devices using the CUDA runtime.
+///
+/// This is best-effort: if CUDA is not available, it returns an empty list.
+pub(crate) fn enumerate_cuda_devices() -> Vec<GpuDeviceInfo> {
+    let count = match bbr_cuda_runtime::cuda_device_count() {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out: Vec<GpuDeviceInfo> = Vec::with_capacity(count);
+    for index in 0..count {
+        let name = bbr_cuda_runtime::cuda_device_name(index).unwrap_or_else(|_| "Unknown CUDA GPU".to_string());
+        out.push(GpuDeviceInfo {
+            backend: GpuBackendKind::Cuda,
+            index,
+            name,
+            vendor: "NVIDIA".to_string(),
+            total_mem_bytes: None,
+            free_mem_bytes: None,
+            vram_total_bytes: 0,
+            vram_free_bytes: 0,
+        });
+    }
+    out
+}
 
 /// Run the CUDA smoketest on the specified device.
 ///
@@ -23,81 +48,9 @@ pub(crate) fn run_cuda_smoketest(device_index: usize, n: usize) -> anyhow::Resul
 
 /// Execute the trivial add1 kernel for an entire packed batch.
 ///
-/// This provides a real "pack -> H2D -> kernel -> D2H -> unpack" path, used as a scaffolding
+/// This provides a real "pack -> H2D -> kernel -> D2H -> unpack" path, used as scaffolding
 /// until the real VDF CUDA kernels are implemented.
 pub(crate) fn add1_batch(device_index: usize, input: &[u32]) -> anyhow::Result<Vec<u32>> {
     bbr_cuda_runtime::add1_execute(device_index, input)
         .with_context(|| format!("CUDA add1_batch failed on device {device_index}"))
-}
-
-
-
-/// Enumerate CUDA devices.
-///
-/// This is best-effort: if CUDA is not available, returns an empty list.
-pub(crate) fn enumerate_cuda_devices() -> Vec<GpuDeviceInfo> {
-    let count = match bbr_cuda_runtime::cuda_device_count() {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let name = bbr_cuda_runtime::cuda_device_name(i).unwrap_or_else(|_| "CUDA device".to_string());
-        out.push(GpuDeviceInfo {
-            backend: GpuBackendKind::Cuda,
-            index: i,
-            name,
-            total_mem_bytes: None,
-        });
-    }
-    out
-}
-
-
-/// Execute a shape-correct GPU batch for Weso proofs.
-///
-/// Semantics:
-/// - `challenges` is a concatenation of N challenges, each exactly 32 bytes.
-/// - Return buffer is N * 200 bytes.
-///   - first 100 bytes are `y`
-///   - second 100 bytes are `witness`
-///
-/// Notes:
-/// - This is currently a *stub compute* kernel, but it is a real CUDA execution path
-///   (H2D -> kernel -> D2H) and matches the required buffer shapes.
-/// - All unsafe CUDA interaction remains inside `bbr-cuda-runtime`.
-pub(crate) fn prove_stub_batch(device_index: usize, challenges: &[u8]) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(
-        challenges.len() % 32 == 0,
-        "invalid packed challenges length: expected multiple of 32, got {}",
-        challenges.len()
-    );
-
-    let jobs = challenges.len() / 32;
-
-    // Pack as u32 words (little-endian): 32 bytes per job -> 8 u32.
-    let mut words: Vec<u32> = Vec::with_capacity(jobs * 8);
-    for chunk in challenges.chunks_exact(4) {
-        words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-
-    let out_words = bbr_cuda_runtime::prove_vdf_execute(device_index, &words, jobs)
-        .with_context(|| format!("CUDA prove_vdf_batch failed on device {device_index}"))?;
-
-    // Unpack u32 words back to bytes.
-    let mut out: Vec<u8> = Vec::with_capacity(out_words.len() * 4);
-    for w in out_words {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-
-    Ok(out)
-}
-
-/// Execute a shape-correct VDF batch (CUDA).
-///
-/// This is the preferred entrypoint for the engine. It keeps the same buffers/shape as the
-/// previous stub, but is wired to the `vdf_prove` PTX kernel (see `bbr-cuda-runtime`).
-pub(crate) fn prove_vdf_batch(device_index: usize, challenges: &[u8]) -> anyhow::Result<Vec<u8>> {
-    prove_stub_batch(device_index, challenges)
 }

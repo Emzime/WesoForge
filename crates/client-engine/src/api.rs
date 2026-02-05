@@ -65,7 +65,7 @@ pub struct EngineConfig {
     pub cpu_reserve_core0: bool,
 
     /// Assign CPU workers on cores in reverse order (last -> ... -> 1).
-    pub cpu_reverse_cores: bool,
+    \1
     /// Optional CPU core allowlist (e.g. \"2,3,6,7,10-15\").
     ///
     /// When set, only those logical cores are used for CPU workers.

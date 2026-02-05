@@ -9,8 +9,9 @@ pub enum GpuBackendKind {
     Opencl,
 }
 
-
-
+/// Structured GPU device identifier.
+///
+/// This is used across the engine/worker boundary to ensure stable routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GpuDeviceId {
     pub backend: GpuBackendKind,
@@ -22,6 +23,7 @@ impl GpuDeviceId {
         Self { backend, index }
     }
 }
+
 /// Basic device identification + sizing hints.
 /// This is intentionally lightweight and backend-agnostic.
 #[derive(Debug, Clone)]
@@ -34,6 +36,14 @@ pub struct GpuDeviceInfo {
     pub name: String,
     /// Vendor string (e.g. "NVIDIA", "AMD") if known.
     pub vendor: String,
+
+    /// Total memory in bytes if known.
+    ///
+    /// This field exists to keep compatibility with earlier iterations of the GPU plumbing.
+    pub total_mem_bytes: Option<u64>,
+    /// Free memory in bytes if known.
+    pub free_mem_bytes: Option<u64>,
+
     /// Total VRAM in bytes if known (0 if unknown).
     pub vram_total_bytes: u64,
     /// Free VRAM in bytes if known (0 if unknown).
@@ -41,6 +51,10 @@ pub struct GpuDeviceInfo {
 }
 
 impl GpuDeviceInfo {
+    pub fn id(&self) -> GpuDeviceId {
+        GpuDeviceId::new(self.backend, self.index)
+    }
+
     pub fn label(&self) -> String {
         format!(
             "{}:{} {} ({})",
@@ -53,6 +67,29 @@ impl GpuDeviceInfo {
             self.vendor
         )
     }
+}
+
+/// Match a single allowlist token against a device.
+///
+/// Supported tokens:
+/// - numeric index: "0", "1" (matches device index within backend)
+/// - substring: matched case-insensitively against label/name/vendor
+pub fn allowlist_matches(dev: &GpuDeviceInfo, token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() {
+        return false;
+    }
+
+    if let Ok(idx) = t.parse::<usize>() {
+        return dev.index == idx;
+    }
+
+    let needle = t.to_ascii_lowercase();
+    let hay_label = dev.label().to_ascii_lowercase();
+    let hay_name = dev.name.to_ascii_lowercase();
+    let hay_vendor = dev.vendor.to_ascii_lowercase();
+
+    hay_label.contains(&needle) || hay_name.contains(&needle) || hay_vendor.contains(&needle)
 }
 
 /// Device selection configuration derived from EngineConfig.
@@ -120,67 +157,49 @@ impl fmt::Display for GpuPlannedDevice {
     }
 }
 
-/// A very rough bytes/job estimate for the current CPU-stub pipeline.
+/// A very rough bytes/job estimate for the current pipeline.
 ///
-/// Once CUDA/OpenCL kernels are implemented, replace with accurate packing size.
 /// For now we assume:
 /// - challenge: 32 bytes
-/// - output (y): 100 bytes (classgroup element-ish; actual may vary)
-/// - witness: ~100 bytes (varies)
+/// - output (y): 100 bytes
+/// - witness: 100 bytes
 /// - plus overhead/alignment
 pub fn estimate_bytes_per_job() -> u64 {
     32 + 100 + 100 + 128
 }
 
-/// Compute an auto batch size for a device.
-/// - If VRAM free is known, use vram_free * ratio
-/// - Otherwise use a conservative fixed heuristic.
+/// Compute a per-device batch size from VRAM and user limits.
+///
+/// This is intentionally conservative until the real GPU kernels and precise memory
+/// accounting are in place.
 pub fn auto_batch_size_for_device(
-    device: &GpuDeviceInfo,
+    dev: &GpuDeviceInfo,
     cfg: &GpuBatchConfig,
     bytes_per_job: u64,
 ) -> (usize, usize) {
-    let min_b = cfg.min_batch.max(1);
-    let max_b = cfg.max_batch.max(min_b);
+    let bytes_per_job = bytes_per_job.max(1);
 
-    // If VRAM is unknown, pick a conservative batch.
-    if device.vram_free_bytes == 0 || bytes_per_job == 0 {
-        let batch = (min_b * 2).min(max_b);
-        return (batch, min_b);
+    let total_bytes: u64 = if dev.vram_total_bytes > 0 {
+        dev.vram_total_bytes
+    } else if let Some(v) = dev.total_mem_bytes {
+        v
+    } else {
+        0
+    };
+
+    let max_from_mem: usize = if total_bytes == 0 {
+        cfg.max_batch
+    } else {
+        let ratio = cfg.vram_ratio.clamp(0.05, 0.95) as f64;
+        let usable = (total_bytes as f64 * ratio) as u64;
+        usize::try_from(usable / bytes_per_job).unwrap_or(cfg.max_batch)
+    };
+
+    let mut batch_size = max_from_mem.clamp(cfg.min_batch.max(1), cfg.max_batch.max(1));
+    if batch_size == 0 {
+        batch_size = 1;
     }
 
-    let ratio = cfg.vram_ratio.clamp(0.0, 0.95);
-    let usable = (device.vram_free_bytes as f64 * ratio as f64).floor() as u64;
-    let raw = (usable / bytes_per_job).max(1) as usize;
-
-    // Round to a multiple of 32 for nicer GPU occupancy alignment.
-    let rounded = (raw / 32).max(1) * 32;
-
-    let batch = rounded.clamp(min_b, max_b);
-    (batch, min_b)
-}
-
-/// Case-insensitive check: allowlist item matches this device.
-pub fn allowlist_matches(device: &GpuDeviceInfo, allow_item: &str) -> bool {
-    let item = allow_item.trim();
-    if item.is_empty() {
-        return false;
-    }
-
-    // Numeric index match
-    if let Ok(idx) = item.parse::<usize>() {
-        return device.index == idx;
-    }
-
-    let needle = item.to_ascii_lowercase();
-    let hay = format!("{} {} {}", device.label(), device.name, device.vendor).to_ascii_lowercase();
-    hay.contains(&needle)
-}
-
-
-impl GpuDeviceInfo {
-    /// Return a structured device id (backend + index).
-    pub fn id(&self) -> GpuDeviceId {
-        GpuDeviceId::new(self.backend, self.index)
-    }
+    let min_batch = cfg.min_batch.min(batch_size).max(1);
+    (batch_size, min_batch)
 }
