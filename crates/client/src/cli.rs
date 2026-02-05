@@ -231,10 +231,22 @@ pub struct Cli {
     /// VRAM utilization ratio for auto batch sizing (0.0..=0.95 recommended).
     ///
     /// The auto-tuner will try to allocate buffers within vram_free * ratio.
-    #[arg(long, env = "BBR_GPU_VRAM_RATIO", default_value_t = default_gpu_vram_ratio(), value_parser = clap::value_parser!(f32).range(0.0..=0.95))]
+    #[arg(long, env = "BBR_GPU_VRAM_RATIO", default_value_t = default_gpu_vram_ratio(), value_parser = parse_gpu_vram_ratio)]
     pub gpu_vram_ratio: f32,
 
     /// Run a local benchmark (e.g. `--bench 0`) and exit.
     #[arg(long, value_name = "ALGO")]
     pub bench: Option<u32>,
+}
+
+
+fn parse_gpu_vram_ratio(s: &str) -> Result<f32, String> {
+    // Validate the VRAM ratio argument.
+    // Accept 0.0..=0.95 to reduce the risk of OOM on fragmented VRAM.
+    let v: f32 = s.parse().map_err(|_| format!("invalid float: {s}"))?;
+    if (0.0..=0.95).contains(&v) {
+        Ok(v)
+    } else {
+        Err("value must be in [0.0, 0.95]".to_string())
+    }
 }

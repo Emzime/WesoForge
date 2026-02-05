@@ -270,6 +270,29 @@ pub struct EngineHandle {
     pub(crate) join: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
+
+impl EngineHandle {
+    /// Subscribe to engine events.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EngineEvent> {
+        self.inner.event_tx.subscribe()
+    }
+
+    /// Request a graceful stop of the engine.
+    pub fn request_stop(&self) {
+        self.inner.request_stop();
+    }
+
+    /// Get a receiver that yields status snapshots.
+    pub fn snapshot_receiver(&self) -> tokio::sync::watch::Receiver<StatusSnapshot> {
+        self.inner.snapshot_rx.clone()
+    }
+
+
+    /// Get the latest snapshot (cloned from the watch receiver).
+    pub fn snapshot(&self) -> StatusSnapshot {
+        self.inner.snapshot_rx.borrow().clone()
+    }
+}
 /// Start a new in-process engine instance.
 pub fn start_engine(config: EngineConfig) -> EngineHandle {
     crate::engine::start_engine(config)
