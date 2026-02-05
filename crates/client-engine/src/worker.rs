@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 
 use bbr_client_core::submitter::SubmitterConfig;
 
-use crate::api::{JobErrorCode, JobOutcome, JobSummary, WorkerStage};
+use crate::api::{JobOutcome, JobSummary, WorkerStage};
 use crate::gpu::GpuDeviceId;
 use crate::backend::{BackendError, BackendJobDto, SubmitResponse, submit_job};
 use crate::cpu_affinity::{CpuPinPolicy, pin_current_thread_with_lists};
@@ -116,6 +116,15 @@ fn default_classgroup_element() -> [u8; 100] {
 struct SubmitFailure {
     message: String,
     drop_inflight: bool,
+}
+
+
+/// Apply CPU core allowlist/blocklist at runtime.
+///
+/// This is a thin wrapper so the engine can configure CPU pinning policy
+/// without reaching into internal details.
+pub(crate) fn set_cpu_core_lists(allowlist: Option<Vec<usize>>, blocklist: Option<Vec<usize>>) {
+    crate::cpu_affinity::set_allowlist_blocklist(allowlist, blocklist);
 }
 
 pub(crate) enum WorkerCommand {
@@ -422,7 +431,6 @@ fn decode_job(worker_idx: usize, job: &BackendJobDto) -> Result<DecodedJob, JobO
                 submit_reason: None,
                 submit_detail: None,
                 drop_inflight: false,
-                    error_code: None,
                 error: Some(format!("Error (bad output_b64: {err:#})")),
                 compute_ms: 0,
                 submit_ms: 0,
@@ -440,7 +448,6 @@ fn decode_job(worker_idx: usize, job: &BackendJobDto) -> Result<DecodedJob, JobO
                 submit_reason: None,
                 submit_detail: None,
                 drop_inflight: false,
-                    error_code: None,
                 error: Some(format!("Error (bad challenge_b64: {err:#})")),
                 compute_ms: 0,
                 submit_ms: 0,
@@ -459,7 +466,6 @@ fn decode_job(worker_idx: usize, job: &BackendJobDto) -> Result<DecodedJob, JobO
                 submit_reason: None,
                 submit_detail: None,
                 drop_inflight: false,
-                    error_code: None,
                 error: Some(format!(
                     "Error (invalid challenge length: expected 32 bytes, got {})",
                     challenge.len()
@@ -481,7 +487,6 @@ fn decode_job(worker_idx: usize, job: &BackendJobDto) -> Result<DecodedJob, JobO
                 submit_reason: None,
                 submit_detail: None,
                 drop_inflight: false,
-                    error_code: None,
                 error: Some(format!(
                     "Error (invalid output length: expected 100 bytes, got {})",
                     output.len()
@@ -556,8 +561,7 @@ async fn run_job_gpu_or_cpu(
                         submit_detail: None,
                         // Drop this inflight so the job can be retried on the CPU path.
                         drop_inflight: true,
-                            error_code: Some(JobErrorCode::GpuComputeFailed),
-                            error: Some(
+                        error: Some(
                             "GPU strict mode: CUDA output mismatch (y != expected output)".to_string(),
                         ),
                         compute_ms: compute_started_at.elapsed().as_millis() as u64,
@@ -587,7 +591,6 @@ async fn run_job_gpu_or_cpu(
                             submit_reason: None,
                             submit_detail: None,
                             drop_inflight: false,
-                    error_code: None,
                             error: Some(status),
                             compute_ms: compute_started_at.elapsed().as_millis() as u64,
                             submit_ms: 0,
@@ -613,8 +616,7 @@ async fn run_job_gpu_or_cpu(
                     submit_detail: None,
                     // Drop this inflight so the job can be retried on the CPU path.
                     drop_inflight: true,
-                            error_code: Some(JobErrorCode::GpuComputeFailed),
-                            error: Some(
+                    error: Some(
                         "GPU strict mode: no CUDA result available for this job".to_string(),
                     ),
                     compute_ms: compute_started_at.elapsed().as_millis() as u64,
@@ -644,7 +646,6 @@ async fn run_job_gpu_or_cpu(
                         submit_reason: None,
                         submit_detail: None,
                         drop_inflight: false,
-                    error_code: None,
                         error: Some(status),
                         compute_ms: compute_started_at.elapsed().as_millis() as u64,
                         submit_ms: 0,
@@ -701,7 +702,6 @@ async fn run_job_gpu_or_cpu(
             submit_reason: Some(res.reason),
             submit_detail: Some(res.detail),
             drop_inflight: false,
-                    error_code: None,
             error: None,
             compute_ms,
             submit_ms,
@@ -714,7 +714,6 @@ async fn run_job_gpu_or_cpu(
             submit_reason: None,
             submit_detail: None,
             drop_inflight: fail.drop_inflight,
-            error_code: None,
             error: Some(fail.message),
             compute_ms,
             submit_ms,
@@ -756,7 +755,6 @@ async fn run_job(
                 submit_reason: None,
                 submit_detail: None,
                 drop_inflight: false,
-                    error_code: None,
                 error: Some(format!("Error (bad output_b64: {err:#})")),
                 compute_ms: 0,
                 submit_ms: 0,
@@ -774,7 +772,6 @@ async fn run_job(
                 submit_reason: None,
                 submit_detail: None,
                 drop_inflight: false,
-                    error_code: None,
                 error: Some(format!("Error (bad challenge_b64: {err:#})")),
                 compute_ms: 0,
                 submit_ms: 0,
@@ -809,7 +806,6 @@ async fn run_job(
                 submit_reason: None,
                 submit_detail: None,
                 drop_inflight: false,
-                    error_code: None,
                 error: Some(status),
                 compute_ms: compute_started_at.elapsed().as_millis() as u64,
                 submit_ms: 0,
@@ -847,7 +843,6 @@ async fn run_job(
             submit_reason: Some(res.reason),
             submit_detail: Some(res.detail),
             drop_inflight: false,
-                    error_code: None,
             error: None,
             compute_ms,
             submit_ms,
@@ -860,7 +855,6 @@ async fn run_job(
             submit_reason: None,
             submit_detail: None,
             drop_inflight: err.drop_inflight,
-            error_code: None,
             error: Some(err.message),
             compute_ms,
             submit_ms,

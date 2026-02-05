@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::backend::{fetch_work, BackendJobDto, BackendWorkBatch};
 use crate::api::{
-    EngineConfig, EngineEvent, EngineHandle, JobErrorCode, JobOutcome, JobSummary, StatusSnapshot, WorkerSnapshot,
+    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot, WorkerSnapshot,
     WorkerStage,
 };
 use crate::cpu_affinity::parse_core_list;
@@ -39,13 +39,10 @@ impl EngineInner {
 }
 
 #[derive(Debug)]
-#[derive(Clone)]
 struct WorkJobItem {
     lease_id: String,
     lease_expires_at: i64,
     job: BackendJobDto,
-    /// If true, this job must only be assigned to CPU workers.
-    cpu_only: bool,
 }
 
 #[derive(Debug)]
@@ -156,9 +153,6 @@ struct EngineRuntime {
     fetch_backoff: Option<Pin<Box<tokio::time::Sleep>>>,
     inflight: Option<InflightStore>,
 
-    // Track currently leased/assigned jobs so we can reroute them when needed.
-    active_jobs: HashMap<u64, WorkJobItem>,
-
     recent_jobs: VecDeque<JobOutcome>,
     snapshot_tx: watch::Sender<StatusSnapshot>,
     inner: Arc<EngineInner>,
@@ -225,7 +219,7 @@ impl EngineRuntime {
 
         if any_progress && sum_speed != self.last_speed_emitted {
             self.last_speed_emitted = sum_speed;
-            self.emit(EngineEvent::Speed { iters_per_sec: sum_speed });
+            self.emit(EngineEvent::Speed { iters_per_sec: sum_speed, busy: busy_workers, total: total_workers });
         }
     }
 
@@ -314,11 +308,9 @@ impl EngineRuntime {
                 continue;
             }
 
-            let Some(first_pos) = self.pending.iter().position(|i| !i.cpu_only) else {
-    break;
-};
-let first = self.pending.get(first_pos).expect("pending pos valid");
-
+            let Some(first) = self.pending.front() else {
+                break;
+            };
 
             let lease_id = first.lease_id.clone();
             let lease_expires_at = first.lease_expires_at;
@@ -331,32 +323,24 @@ let first = self.pending.get(first_pos).expect("pending pos valid");
                 .unwrap_or_else(|| self.gpu_devices.first().cloned().expect("gpu_devices non-empty"));
             let max_batch_for_worker = planned.batch_size.max(1);
 
-            let mut items: Vec<WorkJobItem> = Vec::new();
-while items.len() < max_batch_for_worker {
-    let Some(pos) = self.pending.iter().position(|i| !i.cpu_only) else {
-        break;
-    };
-    let front = self.pending.get(pos).expect("pending pos valid");
-    if front.lease_id != lease_id || front.lease_expires_at != lease_expires_at {
-        break;
-    }
-    let item = self.pending.remove(pos).expect("pending pos valid");
-    items.push(item);
-}
+            let mut jobs: Vec<BackendJobDto> = Vec::new();
+            while jobs.len() < max_batch_for_worker {
+                let Some(front) = self.pending.front() else {
+                    break;
+                };
+                if front.lease_id != lease_id || front.lease_expires_at != lease_expires_at {
+                    break;
+                }
+                let item = self.pending.pop_front().expect("pending front exists");
+                jobs.push(item.job);
+            }
 
-if items.is_empty() {
-    break;
-}
+            if jobs.is_empty() {
+                break;
+            }
 
-for it in &items {
-    self.active_jobs.insert(it.job.job_id, it.clone());
-}
-
-let jobs: Vec<BackendJobDto> = items.iter().map(|it| it.job.clone()).collect();
-
-// Track first job in UI snapshot for this worker.
-let first_job = &jobs[0];
-
+            // Track first job in UI snapshot for this worker.
+            let first_job = &jobs[0];
             let job_summary = JobSummary {
                 job_id: first_job.job_id,
                 height: first_job.height,
@@ -373,11 +357,7 @@ let first_job = &jobs[0];
                 .get(idx)
                 .map(|p| p.store(0, std::sync::atomic::Ordering::Relaxed));
 
-                        for it in &items_for_gpu {
-                self.active_jobs.insert(it.job.job_id, it.clone());
-            }
-
-            let device_label = planned.info.label();
+                        let device_label = planned.info.label();
             let device_id = planned.info.id();
             let _ = self.worker_cmds[idx]
                 .send(WorkerCommand::GpuBatch {
@@ -412,18 +392,9 @@ let first_job = &jobs[0];
                 continue;
             }
 
-            // Prefer CPU-only rerouted jobs first.
-let item = if let Some(pos) = self.pending.iter().position(|i| i.cpu_only) {
-    self.pending.remove(pos).expect("pending pos valid")
-} else {
-    let Some(item) = self.pending.pop_front() else {
-        break;
-    };
-    item
-};
-
-
-            self.active_jobs.insert(item.job.job_id, item.clone());
+            let Some(item) = self.pending.pop_front() else {
+                break;
+            };
 
             let job_summary = JobSummary {
                 job_id: item.job.job_id,
@@ -441,8 +412,6 @@ let item = if let Some(pos) = self.pending.iter().position(|i| i.cpu_only) {
                 .get(idx)
                 .map(|p| p.store(0, std::sync::atomic::Ordering::Relaxed));
 
-            self.active_jobs.insert(item.job.job_id, item.clone());
-
             let _ = self.worker_cmds[idx]
                 .send(WorkerCommand::Job {
                     worker_idx: idx,
@@ -451,11 +420,10 @@ let item = if let Some(pos) = self.pending.iter().position(|i| i.cpu_only) {
                     lease_expires_at: item.lease_expires_at,
                     progress_steps: self.cfg.progress_steps,
                     job: item.job,
-                    cpu_only: false,
                 })
                 .await;
 
-            self.emit(EngineEvent::StartedJob {
+            self.emit(EngineEvent::WorkerJobStarted {
                 worker_idx: idx,
                 job: job_summary,
             });
@@ -487,24 +455,7 @@ let item = if let Some(pos) = self.pending.iter().position(|i| i.cpu_only) {
                 }
                 self.recent_jobs.push_back(outcome.clone());
 
-// If GPU worker reports a structured compute failure, reroute the job to CPU workers.
-if outcome.error_code == Some(JobErrorCode::GpuComputeFailed) {
-    if let Some(mut item) = self.active_jobs.remove(&outcome.job.job_id) {
-        item.cpu_only = true;
-        self.pending.push_front(item);
-        self.emit(EngineEvent::Warning {
-            message: format!(
-                "info: rerouting job {} to CPU workers after GPU compute failure",
-                outcome.job.job_id
-            ),
-        });
-    }
-} else {
-    // Normal completion path.
-    self.active_jobs.remove(&outcome.job.job_id);
-}
-
-                self.emit(EngineEvent::FinishedJob { outcome });
+                self.emit(EngineEvent::JobFinished { outcome });
             }
             WorkerInternalEvent::Warning { message } => {
                 self.emit(EngineEvent::Warning { message });
@@ -517,7 +468,7 @@ if outcome.error_code == Some(JobErrorCode::GpuComputeFailed) {
 
     async fn shutdown_workers(&mut self) {
         for tx in &self.worker_cmds {
-            let _ = tx.send(WorkerCommand::Shutdown).await;
+            let _ = tx.send(WorkerCommand::Stop).await;
         }
 
         for h in self.worker_threads.drain(..) {
@@ -656,10 +607,6 @@ async fn run_engine(
     // Spawn CPU worker threads (each owns its own current-thread Tokio runtime).
     let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
 
-    let mut worker_cmds = Vec::with_capacity(total_workers);
-    let mut worker_progress = Vec::with_capacity(total_workers);
-    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(total_workers);
-
     let submitter = Arc::new(tokio::sync::RwLock::new(cfg.submitter.clone()));
     let warned_invalid_reward_address = Arc::new(AtomicBool::new(false));
 
@@ -735,6 +682,11 @@ async fn run_engine(
     };
 
     let total_workers = cfg.parallel + gpu_workers;
+
+    let mut worker_cmds: Vec<mpsc::Sender<WorkerCommand>> = Vec::with_capacity(total_workers);
+    let mut worker_progress: Vec<Arc<std::sync::atomic::AtomicU64>> = Vec::with_capacity(total_workers);
+    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(total_workers);
+
 
     // ----------------------------------------
     // CPU pinning configuration (process-wide)
@@ -937,7 +889,6 @@ async fn run_engine(
         fetch_task: None,
         fetch_backoff: None,
         inflight: inflight.take(),
-        active_jobs: HashMap::new(),
         recent_jobs: VecDeque::new(),
         snapshot_tx,
         inner,

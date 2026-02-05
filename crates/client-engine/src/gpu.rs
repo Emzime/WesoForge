@@ -3,12 +3,25 @@
 use std::fmt;
 
 /// GPU backend selection used by the engine at runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GpuBackendKind {
     Cuda,
     Opencl,
 }
 
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GpuDeviceId {
+    pub backend: GpuBackendKind,
+    pub index: usize,
+}
+
+impl GpuDeviceId {
+    pub fn new(backend: GpuBackendKind, index: usize) -> Self {
+        Self { backend, index }
+    }
+}
 /// Basic device identification + sizing hints.
 /// This is intentionally lightweight and backend-agnostic.
 #[derive(Debug, Clone)]
@@ -162,4 +175,12 @@ pub fn allowlist_matches(device: &GpuDeviceInfo, allow_item: &str) -> bool {
     let needle = item.to_ascii_lowercase();
     let hay = format!("{} {} {}", device.label(), device.name, device.vendor).to_ascii_lowercase();
     hay.contains(&needle)
+}
+
+
+impl GpuDeviceInfo {
+    /// Return a structured device id (backend + index).
+    pub fn id(&self) -> GpuDeviceId {
+        GpuDeviceId::new(self.backend, self.index)
+    }
 }

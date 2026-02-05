@@ -65,7 +65,7 @@ pub struct EngineConfig {
     pub cpu_reserve_core0: bool,
 
     /// Assign CPU workers on cores in reverse order (last -> ... -> 1).
-    \1
+    pub cpu_reverse_cores: bool,
     /// Optional CPU core allowlist (e.g. \"2,3,6,7,10-15\").
     ///
     /// When set, only those logical cores are used for CPU workers.
@@ -163,19 +163,6 @@ pub struct WorkerSnapshot {
     pub iters_per_sec: u64,
 }
 
-/// Structured job error codes used by the engine scheduler.
-///
-/// This allows callers (and internal scheduling) to distinguish between generic
-/// transient errors (retry) and actionable failures (e.g. reroute GPU->CPU).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum JobErrorCode {
-    /// GPU worker failed CUDA and also failed its local CPU fallback. The scheduler should
-    /// reroute the job to a CPU worker for a final attempt (still under the same lease).
-    GpuComputeFailed,
-}
-
-
-
 /// Result of a completed job (submitted or failed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobOutcome {
@@ -195,9 +182,6 @@ pub struct JobOutcome {
     /// (e.g. `job_not_found`, lease conflicts).
     #[serde(default)]
     pub drop_inflight: bool,
-    /// Structured error code, if any.
-    #[serde(default)]
-    pub error_code: Option<JobErrorCode>,
     /// Human-readable failure message, for compute/submit errors.
     pub error: Option<String>,
     /// Total compute time (milliseconds).

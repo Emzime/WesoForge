@@ -158,4 +158,9 @@ fn inflight_path() -> anyhow::Result<PathBuf> {
     Ok(xdg_state_home()?
         .join("bbr-client")
         .join("inflight-leases.json"))
+
+    /// Return the number of inflight jobs currently tracked.
+    pub(crate) fn len(&self) -> usize {
+        self.jobs_by_id.len()
+    }
 }
