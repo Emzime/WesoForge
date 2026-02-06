@@ -6,20 +6,21 @@ edition.workspace = true
 [lib]
 path = "src/lib.rs"
 
-[features]
-default = []
-cuda = ["dep:cust"]
-opencl = ["dep:opencl3"]
-
 [dependencies]
-thiserror.workspace = true
+thiserror = { workspace = true }
 
-# We reuse the CPU prover as a safe fallback path.
+# CPU fallback glue used by the GPU "plumbing validation" path (source of truth)
 bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
 
-# Optional GPU backends
+# CUDA backend
 cust = { version = "0.3", optional = true }
-opencl3 = { version = "0.10", optional = true }
 
-[lints]
-workspace = true
+# OpenCL backend
+opencl3 = { version = "0.9", optional = true }
+
+[features]
+default = []
+
+cuda = ["dep:cust"]
+opencl = ["dep:opencl3"]
+gpu = ["cuda", "opencl"]
