@@ -1,7 +1,7 @@
 use crate::{GpuApi, GpuDevice};
 
 /// Quick availability check (driver present, API usable).
-pub fn is_available() -> Result<bool, ()> {
+pub(crate) fn is_available() -> Result<bool, ()> {
     // If CUDA is compiled in, try initializing the driver.
     // Any error means not available.
     match cust::CudaFlags::empty() {
@@ -12,13 +12,13 @@ pub fn is_available() -> Result<bool, ()> {
 }
 
 /// CUDA context wrapper.
-pub struct CudaContext {
+pub(crate) struct CudaContext {
     _context: cust::context::Context,
 }
 
 impl CudaContext {
     /// Initialize CUDA (select device 0 by default).
-    pub fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         cust::quick_init()
             .map(|ctx| Self { _context: ctx })
             .map_err(|e| format!("{e}"))
@@ -28,7 +28,7 @@ impl CudaContext {
 /// List CUDA devices.
 ///
 /// Note: uses driver API via `cust`.
-pub fn detect_cuda_devices() -> Result<Vec<GpuDevice>, String> {
+pub(crate) fn detect_cuda_devices() -> Result<Vec<GpuDevice>, String> {
     let _ctx = cust::quick_init().map_err(|e| format!("{e}"))?;
 
     let count = cust::device::Device::num_devices().map_err(|e| format!("{e}"))?;
