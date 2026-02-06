@@ -24,7 +24,7 @@ pub struct GpuDevice {
 ///
 /// If features are disabled, returns an empty list for that backend.
 pub fn detect_devices() -> Vec<GpuDevice> {
-    let mut out = Vec::new();
+    let out = Vec::new();
 
     #[cfg(feature = "cuda")]
     {

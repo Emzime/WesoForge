@@ -13,7 +13,6 @@ opencl = ["dep:opencl3"]
 
 [dependencies]
 thiserror.workspace = true
-anyhow.workspace = true
 
 # We reuse the CPU prover as a safe fallback path.
 bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
