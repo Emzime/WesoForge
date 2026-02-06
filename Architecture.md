@@ -74,6 +74,10 @@ WesoForge
 		│   |
 		│   └── Cargo.toml
 		│
+		├── client-gpu/
+		│   ├──
+		│   └──
+		│
 		└── client-client-gui/
 			├── capabilities/
 			|	└── default.json
