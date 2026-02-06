@@ -24,3 +24,7 @@ bbr-client-engine = { path = "../client-engine" }
 [features]
 # Use the production backend URL as the compiled default for `--backend-url`.
 prod-backend = []
+
+# Forward GPU features to the engine (and thus to client-gpu).
+cuda = ["bbr-client-engine/cuda"]
+opencl = ["bbr-client-engine/opencl"]
