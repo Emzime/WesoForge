@@ -28,9 +28,6 @@ pub(crate) struct InflightStore {
 impl InflightStore {
     pub(crate) fn load() -> anyhow::Result<Option<Self>> {
         let path = inflight_path()?;
-
-        // If the file doesn't exist, we still return an empty store: resume is "enabled",
-        // there is simply nothing to restore.
         if !path.exists() {
             return Ok(Some(Self {
                 path,
@@ -40,7 +37,6 @@ impl InflightStore {
 
         let raw = std::fs::read_to_string(&path)?;
         let file: InflightFile = serde_json::from_str(&raw)?;
-
         let mut jobs_by_id = BTreeMap::new();
         for entry in file.jobs {
             jobs_by_id.insert(entry.job.job_id, entry);
@@ -53,6 +49,29 @@ impl InflightStore {
         self.jobs_by_id.values()
     }
 
+    pub(crate) fn insert_job(
+        &mut self,
+        lease_id: String,
+        lease_expires_at: i64,
+        job: BackendJobDto,
+    ) -> bool {
+        let job_id = job.job_id;
+        let lease_id_for_cmp = lease_id.clone();
+        let entry = InflightJobEntry {
+            lease_id,
+            lease_expires_at,
+            job,
+        };
+        match self.jobs_by_id.insert(job_id, entry) {
+            None => true,
+            Some(prev) => prev.lease_id != lease_id_for_cmp || prev.lease_expires_at != lease_expires_at,
+        }
+    }
+
+    pub(crate) fn remove_job(&mut self, job_id: u64) -> bool {
+        self.jobs_by_id.remove(&job_id).is_some()
+    }
+
     pub(crate) async fn persist(&self) -> anyhow::Result<()> {
         let path = self.path.clone();
         let file = InflightFile {
@@ -60,49 +79,30 @@ impl InflightStore {
             jobs: self.jobs_by_id.values().cloned().collect(),
         };
 
-        // Write on a blocking thread because it may touch the filesystem.
         tokio::task::spawn_blocking(move || persist_file(&path, &file))
             .await
             .map_err(|err| anyhow::anyhow!("persist inflight leases: {err:#}"))??;
-
         Ok(())
-    }
-
-    /// Return the number of inflight jobs currently tracked.
-    pub(crate) fn len(&self) -> usize {
-        self.jobs_by_id.len()
     }
 }
 
 fn persist_file(path: &Path, file: &InflightFile) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if file.jobs.is_empty() {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        return Ok(());
     }
 
     let dir = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid inflight path: no parent directory"))?;
+        .ok_or_else(|| anyhow::anyhow!("invalid inflight path: {}", path.display()))?;
+    std::fs::create_dir_all(dir)?;
 
-    let tmp_path = dir.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("inflight-leases.json")
-    ));
-
-    let payload = serde_json::to_vec_pretty(file)?;
-
-    // Best-effort atomic write: write to a temporary file in the same directory, then rename.
-    std::fs::write(&tmp_path, payload)?;
-
-    // On Windows, rename fails if the destination exists.
-    #[cfg(windows)]
-    {
-        let _ = std::fs::remove_file(path);
-    }
-
-    std::fs::rename(&tmp_path, path)?;
-
+    let json = serde_json::to_string_pretty(file)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(tmp, path)?;
     Ok(())
 }
 

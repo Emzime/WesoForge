@@ -1,10 +1,7 @@
 #!/usr/bin/env pwsh
 $ErrorActionPreference = "Stop"
 
-# Déterminer le répertoire racine correctement
-$ScriptPath = $MyInvocation.MyCommand.Path
-$ScriptDir = Split-Path -Parent $ScriptPath
-$Root = Split-Path -Parent $ScriptDir  # Remonter d'un niveau pour sortir de "builder"
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
 function Get-WorkspaceVersion {

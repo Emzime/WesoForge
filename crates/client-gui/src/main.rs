@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tauri::Manager;
 
 use bbr_client_core::submitter::{SubmitterConfig, load_submitter_config, save_submitter_config};
-use bbr_client_engine::{EngineConfig, EngineEvent, EngineHandle, StatusSnapshot, start_engine, GpuBackend};
+use bbr_client_engine::{EngineConfig, EngineEvent, EngineHandle, StatusSnapshot, start_engine};
 
 struct GuiState {
     engine: Mutex<Option<EngineHandle>>,
@@ -108,24 +108,6 @@ async fn start_client(
         progress_steps: GUI_PROGRESS_STEPS,
         progress_tick: GUI_PROGRESS_TICK,
         recent_jobs_max: EngineConfig::DEFAULT_RECENT_JOBS_MAX,
-
-        // CPU core pinning policy (GUI defaults).
-        cpu_pin_threads: false,
-        cpu_reserve_core0: true,
-        cpu_reverse_cores: false,
-        cpu_core_allowlist: None,
-        cpu_core_blocklist: None,
-
-        // GPU orchestration (GUI defaults: disabled unless the GUI later exposes toggles).
-        gpu_enabled: false,
-        gpu_backend: GpuBackend::Off,
-        gpu_max_devices: None,
-        gpu_device_allowlist: Vec::new(),
-        gpu_inflight_batches: 1,
-        gpu_batch_min: 1,
-        gpu_batch_max: 64,
-        gpu_batch_timeout_ms: 25,
-        gpu_vram_ratio: 0.90,
     });
 
     let mut events = engine.subscribe();
