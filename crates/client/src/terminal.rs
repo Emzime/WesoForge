@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::shutdown::{ShutdownController, ShutdownEvent};
+use crate::shutdown::{ClientEvent, ShutdownController, ShutdownEvent};
 
 #[cfg(unix)]
 fn enable_onlcr() -> anyhow::Result<()> {
@@ -32,7 +32,7 @@ pub struct TuiTerminal {
 impl TuiTerminal {
     pub fn enter(
         shutdown: Arc<ShutdownController>,
-        shutdown_tx: mpsc::UnboundedSender<ShutdownEvent>,
+        event_tx: mpsc::UnboundedSender<ClientEvent>,
     ) -> anyhow::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         #[cfg(unix)]
@@ -59,9 +59,19 @@ impl TuiTerminal {
                     {
                         let n = shutdown.bump_forced();
                         if n == 1 {
-                            let _ = shutdown_tx.send(ShutdownEvent::Graceful);
+                            let _ = event_tx.send(ClientEvent::Shutdown(ShutdownEvent::Graceful));
                         } else {
-                            let _ = shutdown_tx.send(ShutdownEvent::Immediate);
+                            let _ = event_tx.send(ClientEvent::Shutdown(ShutdownEvent::Immediate));
+                        }
+                    }
+
+                    // GPU toggles: keys 0..=9
+                    if key.modifiers.is_empty() {
+                        if let KeyCode::Char(ch) = key.code {
+                            if ch.is_ascii_digit() {
+                                let idx = (ch as u8) - b'0';
+                                let _ = event_tx.send(ClientEvent::ToggleGpuIndex(idx));
+                            }
                         }
                     }
                 }

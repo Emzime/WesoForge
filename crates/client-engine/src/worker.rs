@@ -10,8 +10,9 @@ use reqwest::Url;
 use tokio::sync::mpsc;
 
 use bbr_client_core::submitter::SubmitterConfig;
+use bbr_client_gpu::GpuPreference;
 
-use crate::api::{JobOutcome, JobSummary, WorkerStage};
+use crate::api::{JobOutcome, JobSummary, WorkerKind, WorkerStage};
 use crate::backend::{BackendError, BackendJobDto, SubmitResponse, submit_job};
 
 const DISCRIMINANT_BITS: usize = 1024;
@@ -49,6 +50,7 @@ pub(crate) enum WorkerInternalEvent {
 
 pub(crate) async fn run_worker_task(
     _worker_idx: usize,
+    worker_kind: WorkerKind,
     mut rx: mpsc::Receiver<WorkerCommand>,
     internal_tx: mpsc::UnboundedSender<WorkerInternalEvent>,
     progress: Arc<AtomicU64>,
@@ -69,6 +71,7 @@ pub(crate) async fn run_worker_task(
             } => {
                 let outcome = run_job(
                     worker_idx,
+                    worker_kind.clone(),
                     &internal_tx,
                     progress.clone(),
                     &http,
@@ -89,6 +92,7 @@ pub(crate) async fn run_worker_task(
 
 async fn run_job(
     worker_idx: usize,
+    worker_kind: WorkerKind,
     internal_tx: &mpsc::UnboundedSender<WorkerInternalEvent>,
     progress: Arc<AtomicU64>,
     http: &reqwest::Client,
@@ -114,6 +118,7 @@ async fn run_job(
         Err(err) => {
             return JobOutcome {
                 worker_idx,
+                worker_kind: worker_kind.clone(),
                 job: job_summary,
                 output_mismatch: false,
                 submit_reason: None,
@@ -131,6 +136,7 @@ async fn run_job(
         Err(err) => {
             return JobOutcome {
                 worker_idx,
+                worker_kind: worker_kind.clone(),
                 job: job_summary,
                 output_mismatch: false,
                 submit_reason: None,
@@ -152,6 +158,7 @@ async fn run_job(
     let compute_started_at = Instant::now();
     let (witness, output_mismatch) = match compute_witness(
         worker_idx,
+        worker_kind.clone(),
         internal_tx,
         progress.clone(),
         job.number_of_iterations,
@@ -165,6 +172,7 @@ async fn run_job(
         Err(status) => {
             return JobOutcome {
                 worker_idx,
+                worker_kind,
                 job: job_summary,
                 output_mismatch: false,
                 submit_reason: None,
@@ -202,6 +210,7 @@ async fn run_job(
     match submit_res {
         Ok(res) => JobOutcome {
             worker_idx,
+            worker_kind,
             job: job_summary,
             output_mismatch,
             submit_reason: Some(res.reason),
@@ -214,6 +223,7 @@ async fn run_job(
         },
         Err(err) => JobOutcome {
             worker_idx,
+            worker_kind,
             job: job_summary,
             output_mismatch,
             submit_reason: None,
@@ -229,6 +239,7 @@ async fn run_job(
 
 pub(crate) async fn compute_witness(
     worker_idx: usize,
+    worker_kind: WorkerKind,
     internal_tx: &mpsc::UnboundedSender<WorkerInternalEvent>,
     progress: Arc<AtomicU64>,
     total_iters: u64,
@@ -251,29 +262,74 @@ pub(crate) async fn compute_witness(
 
         let compute = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, bool)> {
             let x = default_classgroup_element();
-            let out = if progress_steps == 0 {
-                bbr_client_chiavdf_fast::prove_one_weso_fast_streaming(
-                    &challenge,
-                    &x,
-                    &output,
-                    DISCRIMINANT_BITS,
-                    total_iters,
-                )
-                .context("chiavdf prove_one_weso_fast_streaming")?
-            } else {
-                let progress_for_cb = progress_clone.clone();
-                bbr_client_chiavdf_fast::prove_one_weso_fast_streaming_with_progress(
-                    &challenge,
-                    &x,
-                    &output,
-                    DISCRIMINANT_BITS,
-                    total_iters,
-                    progress_interval,
-                    move |iters_done| {
-                        progress_for_cb.store(iters_done, Ordering::Relaxed);
-                    },
-                )
-                .context("chiavdf prove_one_weso_fast_streaming_with_progress")?
+            let out = match &worker_kind {
+                WorkerKind::Cpu => {
+                    if progress_steps == 0 {
+                        bbr_client_gpu::prove_one_weso_fast_streaming_auto(
+                            GpuPreference::Auto,
+                            &challenge,
+                            &x,
+                            &output,
+                            DISCRIMINANT_BITS,
+                            total_iters,
+                        )
+                        .context("cpu prove_one_weso_fast_streaming_auto")?
+                    } else {
+                        let progress_for_cb = progress_clone.clone();
+                        bbr_client_gpu::prove_one_weso_fast_streaming_auto_with_progress(
+                            GpuPreference::Auto,
+                            &challenge,
+                            &x,
+                            &output,
+                            DISCRIMINANT_BITS,
+                            total_iters,
+                            progress_interval,
+                            move |iters_done| {
+                                progress_for_cb.store(iters_done, Ordering::Relaxed);
+                            },
+                        )
+                        .context("cpu prove_one_weso_fast_streaming_auto_with_progress")?
+                    }
+                }
+                WorkerKind::Gpu { device_key, .. } => {
+                    // Parse device key (e.g. `cuda:0`, `opencl:1`).
+                    let (api, idx) = if let Some(rest) = device_key.strip_prefix("cuda:") {
+                        (bbr_client_gpu::GpuApi::Cuda, rest.parse::<usize>().unwrap_or(0))
+                    } else if let Some(rest) = device_key.strip_prefix("opencl:") {
+                        (bbr_client_gpu::GpuApi::OpenCl, rest.parse::<usize>().unwrap_or(0))
+                    } else {
+                        (bbr_client_gpu::GpuApi::Cuda, 0)
+                    };
+
+                    if progress_steps == 0 {
+                        bbr_client_gpu::prove_one_weso_fast_streaming_on_device(
+                            api,
+                            idx,
+                            &challenge,
+                            &x,
+                            &output,
+                            DISCRIMINANT_BITS,
+                            total_iters,
+                        )
+                        .context("gpu prove_one_weso_fast_streaming_on_device")?
+                    } else {
+                        let progress_for_cb = progress_clone.clone();
+                        bbr_client_gpu::prove_one_weso_fast_streaming_on_device_with_progress(
+                            api,
+                            idx,
+                            &challenge,
+                            &x,
+                            &output,
+                            DISCRIMINANT_BITS,
+                            total_iters,
+                            progress_interval,
+                            move |iters_done| {
+                                progress_for_cb.store(iters_done, Ordering::Relaxed);
+                            },
+                        )
+                        .context("gpu prove_one_weso_fast_streaming_on_device_with_progress")?
+                    }
+                }
             };
 
             progress_clone.store(total_iters, Ordering::Relaxed);
@@ -354,7 +410,9 @@ async fn submit_witness(
 ) -> Result<SubmitResponse, SubmitFailure> {
     let mut last_submit_err: Option<String> = None;
     let mut attempts: u32 = 0;
-    let mut last_log_at = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
+    let mut last_log_at = Instant::now()
+        .checked_sub(Duration::from_secs(3600))
+        .unwrap_or_else(Instant::now);
 
     loop {
         let now = Utc::now().timestamp();

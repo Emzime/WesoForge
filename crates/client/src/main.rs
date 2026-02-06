@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bbr_client_chiavdf_fast::{set_bucket_memory_budget_bytes, set_enable_streaming_stats};
 use bbr_client_core::submitter::{SubmitterConfig, ensure_submitter_config};
-use bbr_client_engine::{EngineConfig, EngineEvent, start_engine};
+use bbr_client_engine::{EngineConfig, EngineEvent, GpuConfig, GpuMode, start_engine};
 
 use crate::bench::run_benchmark;
 use crate::cli::Cli;
@@ -78,6 +78,20 @@ async fn main() -> anyhow::Result<()> {
     let engine = start_engine(EngineConfig {
         backend_url: cli.backend_url.clone(),
         parallel,
+        gpu: {
+            let mut cfg = GpuConfig::default();
+            // Opt-in via env: WESOFORGE_GPU=cuda|opencl|auto
+            match std::env::var("WESOFORGE_GPU") {
+                Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                    "cuda" => cfg.mode = GpuMode::Cuda,
+                    "opencl" => cfg.mode = GpuMode::OpenCl,
+                    "auto" | "1" | "true" | "yes" => cfg.mode = GpuMode::Auto,
+                    _ => {}
+                },
+                Err(_) => {}
+            }
+            cfg
+        },
         mem_budget_bytes: cli.mem_budget_bytes,
         submitter,
         idle_sleep: Duration::ZERO,

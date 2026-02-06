@@ -14,5 +14,5 @@ mod worker;
 
 pub use api::{
     start_engine, EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary,
-    StatusSnapshot, WorkerSnapshot, WorkerStage,
+    GpuConfig, GpuMode, StatusSnapshot, WorkerKind, WorkerSnapshot, WorkerStage,
 };

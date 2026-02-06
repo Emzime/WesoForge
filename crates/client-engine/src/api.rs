@@ -1,10 +1,73 @@
 //! Public API types for the in-process `bbr-client` engine.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bbr_client_core::submitter::SubmitterConfig;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+
+/// GPU backend selection mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuMode {
+    /// Do not start any GPU workers.
+    Off,
+    /// Start GPU workers for all detected devices (subject to allow/deny lists).
+    Auto,
+    /// Start only CUDA GPU workers.
+    Cuda,
+    /// Start only OpenCL GPU workers.
+    OpenCl,
+}
+
+impl Default for GpuMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+/// GPU configuration for the engine.
+#[derive(Debug, Clone)]
+pub struct GpuConfig {
+    /// GPU mode.
+    pub mode: GpuMode,
+    /// Number of worker tasks to spawn per detected GPU device.
+    pub workers_per_device: usize,
+    /// Allow-list of device keys (e.g. `cuda:0`). If non-empty, only listed devices are used.
+    pub allow: Vec<String>,
+    /// Deny-list of device keys.
+    pub deny: Vec<String>,
+    /// Device keys that should start disabled.
+    pub start_disabled: Vec<String>,
+}
+
+impl Default for GpuConfig {
+    fn default() -> Self {
+        Self {
+            mode: GpuMode::Off,
+            workers_per_device: 1,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            start_disabled: Vec::new(),
+        }
+    }
+}
+
+/// Worker type (CPU or a specific GPU device).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum WorkerKind {
+    /// CPU prover.
+    Cpu,
+    /// GPU prover on a specific device.
+    Gpu {
+        /// Stable device key (e.g. `cuda:0`, `opencl:3`).
+        device_key: String,
+        /// Human readable device name.
+        device_name: String,
+    },
+}
 
 /// Configuration for the in-process engine.
 #[derive(Debug, Clone)]
@@ -14,6 +77,9 @@ pub struct EngineConfig {
 
     /// Number of proof workers to run concurrently.
     pub parallel: usize,
+
+    /// GPU worker configuration.
+    pub gpu: GpuConfig,
 
     /// Memory budget (bytes) for the native streaming prover parameter tuner.
     ///
@@ -83,6 +149,10 @@ pub enum WorkerStage {
 pub struct WorkerSnapshot {
     /// Worker index (0-based).
     pub worker_idx: usize,
+    /// Worker kind (CPU / GPU).
+    pub worker_kind: WorkerKind,
+    /// Whether this worker is enabled.
+    pub enabled: bool,
     /// Current stage.
     pub stage: WorkerStage,
     /// Current job, if any.
@@ -100,6 +170,8 @@ pub struct WorkerSnapshot {
 pub struct JobOutcome {
     /// Worker index (0-based).
     pub worker_idx: usize,
+    /// Worker kind (CPU / GPU).
+    pub worker_kind: WorkerKind,
     /// Job metadata.
     pub job: JobSummary,
     /// Whether the computed output mismatched the expected `y_ref`.
@@ -157,6 +229,20 @@ pub enum EngineEvent {
         /// New stage.
         stage: WorkerStage,
     },
+    /// Worker enabled/disabled state changed.
+    WorkerEnabled {
+        /// Worker index.
+        worker_idx: usize,
+        /// Whether enabled.
+        enabled: bool,
+    },
+    /// GPU device enabled/disabled state changed.
+    GpuEnabled {
+        /// Device key (e.g. `cuda:0`).
+        device_key: String,
+        /// Whether enabled.
+        enabled: bool,
+    },
     /// Worker completed a job (success or failure).
     JobFinished {
         /// Job outcome.
@@ -189,7 +275,7 @@ pub struct StatusSnapshot {
 
 /// Handle to a running in-process engine instance.
 pub struct EngineHandle {
-    pub(crate) inner: std::sync::Arc<crate::engine::EngineInner>,
+    pub(crate) inner: Arc<crate::engine::EngineInner>,
     pub(crate) join: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
@@ -199,26 +285,34 @@ pub fn start_engine(config: EngineConfig) -> EngineHandle {
 }
 
 impl EngineHandle {
-    /// Subscribe to the engine event stream.
+    /// Subscribe to engine events.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EngineEvent> {
         self.inner.event_tx.subscribe()
     }
 
-    /// Get the latest engine snapshot.
-    pub fn snapshot(&self) -> StatusSnapshot {
+    /// Get the latest snapshot.
+    pub fn latest_snapshot(&self) -> StatusSnapshot {
         self.inner.snapshot_rx.borrow().clone()
     }
 
-    /// Request a graceful shutdown (finish in-flight work, stop leasing new jobs).
+    /// Request stop.
     pub fn request_stop(&self) {
         self.inner.request_stop();
     }
 
-    /// Wait for the engine to stop, returning the engine task result.
+    /// Enable/disable a specific worker by index.
+    pub fn set_worker_enabled(&self, worker_idx: usize, enabled: bool) {
+        self.inner.set_worker_enabled(worker_idx, enabled);
+    }
+
+    /// Enable/disable all workers belonging to a given GPU device key.
+    pub fn set_gpu_enabled(&self, device_key: &str, enabled: bool) {
+        self.inner.set_gpu_enabled(device_key, enabled);
+    }
+
+    /// Wait for engine termination.
     pub async fn wait(self) -> anyhow::Result<()> {
-        match self.join.await {
-            Ok(res) => res,
-            Err(err) => Err(anyhow::anyhow!("engine task join error: {err}")),
-        }
+        self.join.await??;
+        Ok(())
     }
 }

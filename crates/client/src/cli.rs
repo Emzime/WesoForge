@@ -1,5 +1,24 @@
 use clap::Parser;
+use clap::ValueEnum;
 use reqwest::Url;
+
+fn parse_csv_list(input: &str) -> Result<Vec<String>, String> {
+    let items = input
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    Ok(items)
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum GpuModeCli {
+    Off,
+    Auto,
+    Cuda,
+    Opencl,
+}
 
 #[cfg(feature = "prod-backend")]
 const DEFAULT_BACKEND_URL: &str = "https://weso.forgeros.fr/";
@@ -88,6 +107,31 @@ pub struct Cli {
         value_parser = parse_mem_budget_bytes
     )]
     pub mem_budget_bytes: u64,
+
+    /// GPU worker mode.
+    #[arg(long, env = "WESOFORGE_GPU_MODE", value_enum, default_value_t = GpuModeCli::Off)]
+    pub gpu_mode: GpuModeCli,
+
+    /// GPU workers per detected device.
+    #[arg(
+        long,
+        env = "WESOFORGE_GPU_WORKERS_PER_DEVICE",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u16).range(1..=64)
+    )]
+    pub gpu_workers_per_device: u16,
+
+    /// Comma-separated allow list of GPU device keys (e.g. `cuda:0,opencl:1`). If set, only these devices are used.
+    #[arg(long, env = "WESOFORGE_GPU_ALLOW", value_parser = parse_csv_list)]
+    pub gpu_allow: Option<Vec<String>>,
+
+    /// Comma-separated deny list of GPU device keys.
+    #[arg(long, env = "WESOFORGE_GPU_DENY", value_parser = parse_csv_list)]
+    pub gpu_deny: Option<Vec<String>>,
+
+    /// Comma-separated list of device keys that should start disabled.
+    #[arg(long, env = "WESOFORGE_GPU_START_DISABLED", value_parser = parse_csv_list)]
+    pub gpu_start_disabled: Option<Vec<String>>,
 
     /// Run a local benchmark (e.g. `--bench 0`) and exit.
     #[arg(long, value_name = "ALGO")]

@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tauri::Manager;
 
 use bbr_client_core::submitter::{SubmitterConfig, load_submitter_config, save_submitter_config};
-use bbr_client_engine::{EngineConfig, EngineEvent, EngineHandle, StatusSnapshot, start_engine};
+use bbr_client_engine::{EngineConfig, EngineEvent, EngineHandle, GpuConfig, GpuMode, StatusSnapshot, start_engine};
 
 struct GuiState {
     engine: Mutex<Option<EngineHandle>>,
@@ -102,6 +102,19 @@ async fn start_client(
     let engine = start_engine(EngineConfig {
         backend_url: default_backend_url(),
         parallel,
+        gpu: {
+            let mut cfg = GpuConfig::default();
+            match std::env::var("WESOFORGE_GPU") {
+                Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                    "cuda" => cfg.mode = GpuMode::Cuda,
+                    "opencl" => cfg.mode = GpuMode::OpenCl,
+                    "auto" | "1" | "true" | "yes" => cfg.mode = GpuMode::Auto,
+                    _ => {}
+                },
+                Err(_) => {}
+            }
+            cfg
+        },
         mem_budget_bytes: 128 * 1024 * 1024,
         submitter,
         idle_sleep: Duration::ZERO,

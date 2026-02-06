@@ -9,18 +9,25 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::api::{
-    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot,
+    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot, WorkerKind,
     WorkerSnapshot, WorkerStage,
 };
 use crate::backend::{BackendJobDto, BackendWorkBatch, fetch_work};
 use crate::inflight::InflightStore;
 use crate::worker::{WorkerCommand, WorkerInternalEvent};
 
+use bbr_client_gpu::{detect_devices, GpuApi};
+
 pub(crate) struct EngineInner {
     pub(crate) event_tx: broadcast::Sender<EngineEvent>,
     pub(crate) snapshot_rx: watch::Receiver<StatusSnapshot>,
     stop_requested: AtomicBool,
     notify: tokio::sync::Notify,
+
+    // Shared worker enable flags (set by run_engine).
+    worker_enabled: std::sync::Mutex<Vec<Arc<AtomicBool>>>,
+    // Map of GPU device_key -> worker indices.
+    gpu_worker_map: std::sync::Mutex<std::collections::HashMap<String, Vec<usize>>>,
 }
 
 impl EngineInner {
@@ -33,6 +40,35 @@ impl EngineInner {
 
     fn should_stop(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_worker_enabled(&self, worker_idx: usize, enabled: bool) {
+        let list = self.worker_enabled.lock().unwrap();
+        if let Some(flag) = list.get(worker_idx) {
+            flag.store(enabled, Ordering::SeqCst);
+            let _ = self
+                .event_tx
+                .send(EngineEvent::WorkerEnabled { worker_idx, enabled });
+        }
+    }
+
+    pub(crate) fn set_gpu_enabled(&self, device_key: &str, enabled: bool) {
+        let map = self.gpu_worker_map.lock().unwrap();
+        if let Some(indices) = map.get(device_key) {
+            let list = self.worker_enabled.lock().unwrap();
+            for &idx in indices {
+                if let Some(flag) = list.get(idx) {
+                    flag.store(enabled, Ordering::SeqCst);
+                    let _ = self
+                        .event_tx
+                        .send(EngineEvent::WorkerEnabled { worker_idx: idx, enabled });
+                }
+            }
+            let _ = self.event_tx.send(EngineEvent::GpuEnabled {
+                device_key: device_key.to_string(),
+                enabled,
+            });
+        }
     }
 }
 
@@ -142,6 +178,8 @@ struct EngineRuntime {
     cfg: EngineConfig,
 
     workers: Vec<WorkerRuntime>,
+    worker_kinds: Vec<WorkerKind>,
+    worker_enabled: Vec<Arc<AtomicBool>>,
     worker_cmds: Vec<mpsc::Sender<WorkerCommand>>,
     worker_progress: Vec<Arc<std::sync::atomic::AtomicU64>>,
     internal_rx: mpsc::UnboundedReceiver<WorkerInternalEvent>,
@@ -165,6 +203,16 @@ impl EngineRuntime {
             .enumerate()
             .map(|(idx, w)| WorkerSnapshot {
                 worker_idx: idx,
+                worker_kind: self
+                    .worker_kinds
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or(WorkerKind::Cpu),
+                enabled: self
+                    .worker_enabled
+                    .get(idx)
+                    .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(true),
                 stage: w.stage,
                 job: w.job.clone(),
                 iters_done: self
@@ -194,7 +242,18 @@ impl EngineRuntime {
     }
 
     fn idle_count(&self) -> usize {
-        self.workers.iter().filter(|w| w.is_idle()).count()
+        self.workers
+            .iter()
+            .enumerate()
+            .filter(|(idx, w)| {
+                w.is_idle()
+                    && self
+                        .worker_enabled
+                        .get(*idx)
+                        .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or(true)
+            })
+            .count()
     }
 
     fn all_idle(&self) -> bool {
@@ -241,6 +300,15 @@ impl EngineRuntime {
         let mut snapshot_dirty = false;
         for idx in 0..self.workers.len() {
             if !self.workers[idx].is_idle() {
+                continue;
+            }
+
+            if !self
+                .worker_enabled
+                .get(idx)
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(true)
+            {
                 continue;
             }
             let Some(item) = self.pending.pop_front() else {
@@ -539,6 +607,9 @@ pub(crate) fn start_engine(cfg: EngineConfig) -> EngineHandle {
         snapshot_rx,
         stop_requested: AtomicBool::new(false),
         notify: tokio::sync::Notify::new(),
+
+        worker_enabled: std::sync::Mutex::new(Vec::new()),
+        gpu_worker_map: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let join = tokio::spawn(run_engine(inner.clone(), snapshot_tx, cfg));
@@ -593,11 +664,77 @@ async fn run_engine(
 
     let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
 
-    let mut worker_cmds = Vec::with_capacity(cfg.parallel);
-    let mut worker_progress = Vec::with_capacity(cfg.parallel);
-    let mut worker_join = JoinSet::new();
+    // Build worker specs: CPU workers first, then GPU workers (one or more per device).
+    let mut worker_kinds: Vec<WorkerKind> = Vec::new();
+    let mut worker_enabled: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut gpu_worker_map: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
 
-    for worker_idx in 0..cfg.parallel {
+    for _ in 0..cfg.parallel {
+        worker_kinds.push(WorkerKind::Cpu);
+        worker_enabled.push(Arc::new(AtomicBool::new(true)));
+    }
+
+    // GPU devices are optional at build time.
+    let gpu_cfg = cfg.gpu.clone();
+    if gpu_cfg.mode != crate::api::GpuMode::Off {
+        let devices = detect_devices();
+        // Filter devices by mode.
+        for dev in devices {
+            let api_ok = match gpu_cfg.mode {
+                crate::api::GpuMode::Auto => true,
+                crate::api::GpuMode::Cuda => dev.api == GpuApi::Cuda,
+                crate::api::GpuMode::OpenCl => dev.api == GpuApi::OpenCl,
+                crate::api::GpuMode::Off => false,
+            };
+            if !api_ok {
+                continue;
+            }
+
+            let prefix = match dev.api {
+                GpuApi::Cuda => "cuda",
+                GpuApi::OpenCl => "opencl",
+            };
+            let device_key = format!("{prefix}:{}", dev.device_index);
+
+            if !gpu_cfg.allow.is_empty() && !gpu_cfg.allow.iter().any(|k| k == &device_key) {
+                continue;
+            }
+            if gpu_cfg.deny.iter().any(|k| k == &device_key) {
+                continue;
+            }
+
+            let start_enabled = !gpu_cfg.start_disabled.iter().any(|k| k == &device_key);
+
+            let workers_per_device = gpu_cfg.workers_per_device.max(1);
+            for _ in 0..workers_per_device {
+                let idx = worker_kinds.len();
+                worker_kinds.push(WorkerKind::Gpu {
+                    device_key: device_key.clone(),
+                    device_name: dev.name.clone(),
+                });
+                worker_enabled.push(Arc::new(AtomicBool::new(start_enabled)));
+                gpu_worker_map.entry(device_key.clone()).or_default().push(idx);
+            }
+        }
+    }
+
+    // Publish enable flags + gpu map to the handle.
+    {
+        let mut list = inner.worker_enabled.lock().unwrap();
+        *list = worker_enabled.clone();
+        let mut map = inner.gpu_worker_map.lock().unwrap();
+        *map = gpu_worker_map;
+    }
+
+    let total_workers = worker_kinds.len();
+    let (mut worker_cmds, mut worker_progress, mut worker_join) = (
+        Vec::with_capacity(total_workers),
+        Vec::with_capacity(total_workers),
+        JoinSet::new(),
+    );
+
+    for worker_idx in 0..total_workers {
         let (tx, rx) = mpsc::channel::<WorkerCommand>(1);
         worker_cmds.push(tx);
 
@@ -610,9 +747,15 @@ async fn run_engine(
         let internal_tx = internal_tx.clone();
         let progress = progress.clone();
 
+        let kind = worker_kinds
+            .get(worker_idx)
+            .cloned()
+            .unwrap_or(WorkerKind::Cpu);
+
         worker_join.spawn(async move {
             crate::worker::run_worker_task(
                 worker_idx,
+                kind,
                 rx,
                 internal_tx,
                 progress,
@@ -624,7 +767,7 @@ async fn run_engine(
         });
     }
 
-    let workers = (0..cfg.parallel).map(|_| WorkerRuntime::new()).collect();
+    let workers = (0..total_workers).map(|_| WorkerRuntime::new()).collect();
 
     let mut inflight = match InflightStore::load() {
         Ok(Some(store)) => Some(store),
@@ -686,6 +829,8 @@ async fn run_engine(
         http,
         cfg,
         workers,
+        worker_kinds,
+        worker_enabled,
         worker_cmds,
         worker_progress,
         internal_rx,
