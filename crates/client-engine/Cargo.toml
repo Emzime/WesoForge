@@ -3,6 +3,11 @@ name = "bbr-client-engine"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+cuda = ["bbr-client-gpu/cuda"]
+opencl = ["bbr-client-gpu/opencl"]
+
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -15,3 +20,5 @@ tokio = { workspace = true }
 
 bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
 bbr-client-core = { path = "../client-core" }
+
+bbr-client-gpu = { path = "../client-gpu" }

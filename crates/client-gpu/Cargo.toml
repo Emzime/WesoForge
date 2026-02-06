@@ -1,0 +1,26 @@
+[package]
+name = "bbr-client-gpu"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+cuda = ["dep:cust"]
+opencl = ["dep:opencl3"]
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
+
+# We reuse the CPU prover as a safe fallback path.
+bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
+
+# Optional GPU backends
+cust = { version = "0.3", optional = true }
+opencl3 = { version = "0.10", optional = true }
+
+[lints]
+workspace = true
