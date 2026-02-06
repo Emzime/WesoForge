@@ -75,8 +75,19 @@ WesoForge
 		│   └── Cargo.toml
 		│
 		├── client-gpu/
-		│   ├──
-		│   └──
+		│   ├── src
+		│   |	├── cuda/
+		|	|	|	├── kernels.ptx
+		|	|	|	└── mod.rs
+		│   |	|
+		│   |	├── opencl/
+		|	|	|	└── mod.rs
+		│   |	|
+		│   |	├── detect.rs
+		│   |	├── error.rs
+		│   |	└── lib.rs
+		│   |
+		│   └── Cargo.toml
 		│
 		└── client-client-gui/
 			├── capabilities/

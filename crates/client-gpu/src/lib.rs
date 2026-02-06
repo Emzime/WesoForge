@@ -40,6 +40,8 @@ pub fn prove_one_weso_fast_streaming_auto(
                 log_backend("CUDA available; running phase-1 kernel (plumbing validation)");
                 let _ctx = cuda::CudaContext::new().map_err(ClientGpuError::CudaInit)?;
                 cuda::run_spin_kernel(num_iterations).map_err(ClientGpuError::CudaInit)?;
+            } else {
+                log_backend("CUDA requested but not available; using CPU");
             }
         }
     }
@@ -88,6 +90,8 @@ where
                 log_backend("CUDA available; running phase-1 kernel (plumbing validation) [with progress]");
                 let _ctx = cuda::CudaContext::new().map_err(ClientGpuError::CudaInit)?;
                 cuda::run_spin_kernel(num_iterations).map_err(ClientGpuError::CudaInit)?;
+            } else {
+                log_backend("CUDA requested but not available [with progress]; using CPU");
             }
         }
     }
