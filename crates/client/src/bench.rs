@@ -9,8 +9,6 @@ use bbr_client_chiavdf_fast::{
     prove_one_weso_fast_streaming, prove_one_weso_fast_streaming_getblock_opt,
 };
 
-use bbr_client_gpu::{GpuPreference, prove_one_weso_fast_streaming_auto_with_progress};
-
 use crate::constants::default_classgroup_element;
 use crate::format::{format_duration, format_number};
 
@@ -29,32 +27,14 @@ pub fn run_benchmark(algo: u32) -> anyhow::Result<()> {
 
     match algo {
         0 => {
-            if BENCH_Y_REF_B64.starts_with("<fill-me") {
-                anyhow::bail!(
-                    "bench vector missing: set BENCH_Y_REF_B64 from the `Y (b64)` output of `--bench 0`"
-                );
-            }
-
-            let y_ref = B64
-                .decode(BENCH_Y_REF_B64.as_bytes())
-                .context("decode BENCH_Y_REF_B64")?;
-
-            // Warm up CPU a bit (this does not affect GPU selection).
-            let _ = prove_one_weso_fast(&BENCH_CHALLENGE, &x, BENCH_DISCRIMINANT_BITS, WARMUP_ITERS)
-                .context("warmup prove_one_weso_fast")?;
+            let _ =
+                prove_one_weso_fast(&BENCH_CHALLENGE, &x, BENCH_DISCRIMINANT_BITS, WARMUP_ITERS)
+                    .context("warmup prove_one_weso_fast")?;
 
             let started_at = Instant::now();
-            let out = prove_one_weso_fast_streaming_auto_with_progress(
-                GpuPreference::Auto,
-                &BENCH_CHALLENGE,
-                &x,
-                &y_ref,
-                BENCH_DISCRIMINANT_BITS,
-                BENCH_ITERS,
-                0,
-                move |_iters_done| {},
-            )
-            .context("bench prove_one_weso_fast_streaming_auto_with_progress")?;
+            let out =
+                prove_one_weso_fast(&BENCH_CHALLENGE, &x, BENCH_DISCRIMINANT_BITS, BENCH_ITERS)
+                    .context("bench prove_one_weso_fast")?;
             let duration = started_at.elapsed();
 
             let half = out.len() / 2;

@@ -5,7 +5,6 @@ members = [
   "crates/client-engine",
   "crates/client-gui",
   "crates/chiavdf-fast",
-  "crates/client-gpu",
 ]
 resolver = "2"
 

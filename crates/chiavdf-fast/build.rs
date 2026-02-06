@@ -149,9 +149,7 @@ or set BBR_CHIAVDF_DIR to a chiavdf checkout.",
 
 fn build_windows_fallback(manifest_dir: &PathBuf, chiavdf_dir: &PathBuf, chiavdf_src: &PathBuf) {
     let fallback_cpp = manifest_dir.join("native").join("chiavdf_fast_fallback.cpp");
-    let lzcnt_c = chiavdf_src.join("refcode").join("lzcnt.c");
     println!("cargo:rerun-if-changed={}", fallback_cpp.display());
-    println!("cargo:rerun-if-changed={}", lzcnt_c.display());
 
     // The chiavdf repository expects the MPIR (GMP-compatible) Windows bundle to
     // live at `chiavdf/mpir_gc_x64`.
@@ -178,41 +176,23 @@ fn build_windows_fallback(manifest_dir: &PathBuf, chiavdf_dir: &PathBuf, chiavdf
         }
     });
 
-    // Compile the C++ fallback as C++17. (Do not compile lzcnt.c in the same unit:
-    // clang-cl will treat it as C and warn that /std:c++17 is unused.)
-    let mut build_cpp = cc::Build::new();
-    build_cpp.cpp(true);
-    build_cpp.compiler(clang_cl.clone());
-    build_cpp.flag("/std:c++17");
-    build_cpp.flag("/EHsc");
-    build_cpp.flag("/O2");
-    build_cpp.define("_CRT_SECURE_NO_WARNINGS", None);
-
-    // Silence warnings coming from chiavdf's bundled C/C++ headers.
-    // These are not actionable in this crate and pollute CI output.
-    build_cpp.flag("/clang:-Wno-unused-parameter");
-    build_cpp.flag("/clang:-Wno-unused-but-set-variable");
-    build_cpp.flag("/clang:-Wno-deprecated-literal-operator");
-    build_cpp.flag("/clang:-Wno-unused-command-line-argument");
-
-    build_cpp.include(chiavdf_src);
-    build_cpp.include(&mpir_dir);
-    build_cpp.file(fallback_cpp);
-    build_cpp.compile("chiavdf_fastc");
-
-    // Compile lzcnt.c as C (not C++) to keep C linkage where expected.
-    let mut build_c = cc::Build::new();
-    build_c.compiler(clang_cl);
-    build_c.flag("/O2");
-    build_c.include(chiavdf_src);
-    build_c.file(lzcnt_c);
-    build_c.compile("lzcnt");
+    let mut build = cc::Build::new();
+    build.cpp(true);
+    build.compiler(clang_cl);
+    build.flag("/std:c++17");
+    build.flag("/EHsc");
+    build.flag("/O2");
+    build.define("_CRT_SECURE_NO_WARNINGS", None);
+    build.include(chiavdf_src);
+    build.include(&mpir_dir);
+    build.file(fallback_cpp);
+    build.file(chiavdf_src.join("refcode").join("lzcnt.c"));
+    build.compile("chiavdf_fastc");
 
     // Link against MPIR (GMP-compatible) import library.
     println!("cargo:rustc-link-search=native={}", mpir_dir.display());
     println!("cargo:rustc-link-lib=mpir");
 }
-
 
 /// Build the portable "slow" fallback on macOS ARM (Apple Silicon). The full
 /// chiavdf fast engine uses x86 intrinsics/assembly and is not available there.

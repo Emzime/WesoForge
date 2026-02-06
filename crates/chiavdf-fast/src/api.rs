@@ -219,11 +219,10 @@ where
     if num_iterations == 0 {
         return Err(ChiavdfFastError::InvalidInput("num_iterations must be > 0"));
     }
-    if progress_interval == 0 {
-        return Err(ChiavdfFastError::InvalidInput(
-            "progress_interval must be > 0",
-        ));
-    }
+    // Be defensive: some callers disable UI progress (e.g. no TUI) but still route
+    // through the *_with_progress APIs. Treat a zero interval as 'at least once'
+    // to avoid hard failures.
+    let progress_interval = progress_interval.max(1);
 
     let cb: &mut (dyn FnMut(u64) + Send) = &mut progress;
     let mut ctx = ProgressCtx {
@@ -328,11 +327,10 @@ where
     if num_iterations == 0 {
         return Err(ChiavdfFastError::InvalidInput("num_iterations must be > 0"));
     }
-    if progress_interval == 0 {
-        return Err(ChiavdfFastError::InvalidInput(
-            "progress_interval must be > 0",
-        ));
-    }
+    // Be defensive: some callers disable UI progress (e.g. no TUI) but still route
+    // through the *_with_progress APIs. Treat a zero interval as 'at least once'
+    // to avoid hard failures.
+    let progress_interval = progress_interval.max(1);
 
     let cb: &mut (dyn FnMut(u64) + Send) = &mut progress;
     let mut ctx = ProgressCtx {
@@ -437,11 +435,10 @@ where
     if num_iterations == 0 {
         return Err(ChiavdfFastError::InvalidInput("num_iterations must be > 0"));
     }
-    if progress_interval == 0 {
-        return Err(ChiavdfFastError::InvalidInput(
-            "progress_interval must be > 0",
-        ));
-    }
+    // Be defensive: some callers disable UI progress (e.g. no TUI) but still route
+    // through the *_with_progress APIs. Treat a zero interval as 'at least once'
+    // to avoid hard failures.
+    let progress_interval = progress_interval.max(1);
 
     let cb: &mut (dyn FnMut(u64) + Send) = &mut progress;
     let mut ctx = ProgressCtx {

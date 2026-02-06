@@ -3,11 +3,6 @@ name = "bbr-client-engine"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-cuda = ["bbr-client-gpu/cuda"]
-opencl = ["bbr-client-gpu/opencl"]
-
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -21,4 +16,15 @@ tokio = { workspace = true }
 bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
 bbr-client-core = { path = "../client-core" }
 
-bbr-client-gpu = { path = "../client-gpu" }
+# Optional GPU backend crate (CUDA / OpenCL live there)
+bbr-client-gpu = { path = "../client-gpu", optional = true, default-features = false }
+
+[features]
+default = []
+
+# Forward GPU features to the GPU crate
+cuda = ["dep:bbr-client-gpu", "bbr-client-gpu/cuda"]
+opencl = ["dep:bbr-client-gpu", "bbr-client-gpu/opencl"]
+
+# Convenience meta-feature
+gpu = ["cuda", "opencl"]

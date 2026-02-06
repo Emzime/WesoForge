@@ -10,7 +10,6 @@ use reqwest::Url;
 use tokio::sync::mpsc;
 
 use bbr_client_core::submitter::SubmitterConfig;
-use bbr_client_gpu::GpuPreference;
 
 use crate::api::{JobOutcome, JobSummary, WorkerStage};
 use crate::backend::{BackendError, BackendJobDto, SubmitResponse, submit_job};
@@ -253,19 +252,17 @@ pub(crate) async fn compute_witness(
         let compute = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, bool)> {
             let x = default_classgroup_element();
             let out = if progress_steps == 0 {
-                bbr_client_gpu::prove_one_weso_fast_streaming_auto(
-                    GpuPreference::Auto,
+                bbr_client_chiavdf_fast::prove_one_weso_fast_streaming(
                     &challenge,
                     &x,
                     &output,
                     DISCRIMINANT_BITS,
                     total_iters,
                 )
-                .context("gpu/cpu prove_one_weso_fast_streaming_auto")?
+                .context("chiavdf prove_one_weso_fast_streaming")?
             } else {
                 let progress_for_cb = progress_clone.clone();
-                bbr_client_gpu::prove_one_weso_fast_streaming_auto_with_progress(
-                    GpuPreference::Auto,
+                bbr_client_chiavdf_fast::prove_one_weso_fast_streaming_with_progress(
                     &challenge,
                     &x,
                     &output,
@@ -276,7 +273,7 @@ pub(crate) async fn compute_witness(
                         progress_for_cb.store(iters_done, Ordering::Relaxed);
                     },
                 )
-                .context("gpu/cpu prove_one_weso_fast_streaming_auto_with_progress")?
+                .context("chiavdf prove_one_weso_fast_streaming_with_progress")?
             };
 
             progress_clone.store(total_iters, Ordering::Relaxed);
@@ -357,9 +354,7 @@ async fn submit_witness(
 ) -> Result<SubmitResponse, SubmitFailure> {
     let mut last_submit_err: Option<String> = None;
     let mut attempts: u32 = 0;
-    let mut last_log_at = Instant::now()
-        .checked_sub(Duration::from_secs(3600))
-        .unwrap_or_else(Instant::now);
+    let mut last_log_at = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
 
     loop {
         let now = Utc::now().timestamp();
