@@ -3,7 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    // Re-run if MPIR DLLs change.
     println!("cargo:rerun-if-changed=../../chiavdf/mpir_gc_x64");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -15,10 +14,7 @@ fn main() {
 
     let mpir_dir = workspace_root.join("chiavdf").join("mpir_gc_x64");
     if !mpir_dir.exists() {
-        println!(
-            "cargo:warning=MPIR directory not found: {}",
-            mpir_dir.display()
-        );
+        // Don't spam warnings; runtime will fail anyway if MPIR is missing.
         return;
     }
 
@@ -52,20 +48,20 @@ fn main() {
     for dll in dlls {
         let src = mpir_dir.join(dll);
         if !src.exists() {
-            println!("cargo:warning=MPIR DLL missing: {}", src.display());
             continue;
         }
 
         let dst = target_profile_dir.join(dll);
-        if let Err(e) = fs::copy(&src, &dst) {
-            println!(
-                "cargo:warning=Failed to copy {} -> {}: {e}",
-                src.display(),
-                dst.display()
-            );
-            continue;
-        }
 
-        println!("cargo:warning=Copied {} -> {}", src.display(), dst.display());
+        // Copy only if missing or different size to reduce I/O
+        let do_copy = match (fs::metadata(&src), fs::metadata(&dst)) {
+            (Ok(ms), Ok(md)) => ms.len() != md.len(),
+            (Ok(_), Err(_)) => true,
+            _ => false,
+        };
+
+        if do_copy {
+            let _ = fs::copy(&src, &dst);
+        }
     }
 }

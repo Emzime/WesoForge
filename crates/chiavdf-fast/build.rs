@@ -13,7 +13,6 @@ fn main() {
 
     let chiavdf_dir = env::var("BBR_CHIAVDF_DIR")
         .map(PathBuf::from)
-        // Default to the `chiavdf/` git submodule.
         .unwrap_or_else(|_| {
             let submodule = repo_root.join("chiavdf");
             if submodule
@@ -70,22 +69,21 @@ or set BBR_CHIAVDF_DIR to a chiavdf checkout.",
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
     if target_os == "windows" {
         build_windows_fallback(&manifest_dir, &chiavdf_dir, &chiavdf_src);
         return;
     }
-    // The full chiavdf fast engine uses x86 intrinsics and assembly; use the
-    // portable "slow" fallback on macOS ARM (Apple Silicon) instead.
+
     if target_os == "macos" && target_arch == "aarch64" {
         build_macos_arm_fallback(&manifest_dir, &chiavdf_src);
         return;
     }
 
-    // GMP (and gmpxx) may be in a non-default location (e.g. Homebrew on macOS).
-    // Pass include path via CXXFLAGS so the compiler can find <gmpxx.h> and <gmp.h>.
     let (gmp_cflags, gmp_link_search) = detect_gmp_paths();
     let mut make_env: Vec<(String, String)> = Vec::new();
     let mut cxxflags = gmp_cflags.clone().unwrap_or_default();
+
     if let Some(ref boost) = detect_boost_include() {
         if !cxxflags.is_empty() {
             cxxflags.push(' ');
@@ -107,10 +105,10 @@ or set BBR_CHIAVDF_DIR to a chiavdf checkout.",
     for (k, v) in &make_env {
         make_cmd.env(k, v);
     }
+
     let status = make_cmd
         .arg("-f")
         .arg("Makefile.vdf-client")
-        // Let `make` use its incremental rebuild logic.
         .arg("fastlib")
         .arg("PIC=1")
         .arg("LTO=")
@@ -127,21 +125,16 @@ or set BBR_CHIAVDF_DIR to a chiavdf checkout.",
     }
     println!("cargo:rustc-link-lib=static=chiavdf_fastc");
 
-    // chiavdf depends on GMP and pthread.
     println!("cargo:rustc-link-lib=gmpxx");
     println!("cargo:rustc-link-lib=gmp");
     println!("cargo:rustc-link-lib=pthread");
 
-    // We link C++ objects, so we need the C++ standard library.
-    // Keep it simple: this project currently targets Linux.
     if target_os == "macos" {
         println!("cargo:rustc-link-lib=c++");
     } else if target_os != "windows" {
         println!("cargo:rustc-link-lib=stdc++");
     }
 
-    // chiavdf's generated assembly isn't PIE/PIC-safe. Rust builds PIE binaries by default
-    // on many Linux distros, so disable PIE for any binary that links this crate.
     if target_os == "linux" {
         println!("cargo:rustc-link-arg=-no-pie");
     }
@@ -151,8 +144,6 @@ fn build_windows_fallback(manifest_dir: &PathBuf, chiavdf_dir: &PathBuf, chiavdf
     let fallback_cpp = manifest_dir.join("native").join("chiavdf_fast_fallback.cpp");
     println!("cargo:rerun-if-changed={}", fallback_cpp.display());
 
-    // The chiavdf repository expects the MPIR (GMP-compatible) Windows bundle to
-    // live at `chiavdf/mpir_gc_x64`.
     let mpir_dir = chiavdf_dir.join("mpir_gc_x64");
     let mpir_lib = mpir_dir.join("mpir.lib");
     if !mpir_lib.exists() {
@@ -162,11 +153,6 @@ fn build_windows_fallback(manifest_dir: &PathBuf, chiavdf_dir: &PathBuf, chiavdf
         );
     }
 
-    // The chiavdf sources use GNU/Clang builtins (e.g. __builtin_clzll) even
-    // on Windows. Compile this fallback with clang-cl for compatibility.
-    //
-    // Prefer an explicit path if the user configured one; otherwise fall back
-    // to the default winget install location.
     let clang_cl = env::var("BBR_CLANG_CL").unwrap_or_else(|_| {
         let default = PathBuf::from(r"C:\Program Files\LLVM\bin\clang-cl.exe");
         if default.exists() {
@@ -176,26 +162,54 @@ fn build_windows_fallback(manifest_dir: &PathBuf, chiavdf_dir: &PathBuf, chiavdf
         }
     });
 
-    let mut build = cc::Build::new();
-    build.cpp(true);
-    build.compiler(clang_cl);
-    build.flag("/std:c++17");
-    build.flag("/EHsc");
-    build.flag("/O2");
-    build.define("_CRT_SECURE_NO_WARNINGS", None);
-    build.include(chiavdf_src);
-    build.include(&mpir_dir);
-    build.file(fallback_cpp);
-    build.file(chiavdf_src.join("refcode").join("lzcnt.c"));
-    build.compile("chiavdf_fastc");
+    // -------------------------
+    // 1) Build C++ fallback (.cpp)
+    // -------------------------
+    let mut build_cpp = cc::Build::new();
+    build_cpp.cpp(true);
+    build_cpp.compiler(&clang_cl);
 
-    // Link against MPIR (GMP-compatible) import library.
+    build_cpp.flag("/EHsc");
+    build_cpp.flag("/O2");
+    build_cpp.flag("/std:c++17");
+
+    // Silence warnings coming from chiavdf headers / mpir gmpxx headers.
+    build_cpp.flag("/clang:-Wno-unused-parameter");
+    build_cpp.flag("/clang:-Wno-unused-but-set-variable");
+    build_cpp.flag("/clang:-Wno-deprecated-literal-operator");
+    build_cpp.flag("/clang:-Wno-unused-command-line-argument");
+
+    build_cpp.define("_CRT_SECURE_NO_WARNINGS", None);
+    build_cpp.include(chiavdf_src);
+    build_cpp.include(&mpir_dir);
+    build_cpp.file(&fallback_cpp);
+    build_cpp.compile("chiavdf_fastc_fallback_cpp");
+
+    // -------------------------
+    // 2) Build lzcnt.c as C (no /std:c++17)
+    // -------------------------
+    let lzcnt_c = chiavdf_src.join("refcode").join("lzcnt.c");
+    println!("cargo:rerun-if-changed={}", lzcnt_c.display());
+
+    let mut build_c = cc::Build::new();
+    build_c.cpp(false);
+    build_c.compiler(&clang_cl);
+
+    build_c.flag("/O2");
+
+    // Also silence if clang emits "unused-command-line-argument" for other flags.
+    build_c.flag("/clang:-Wno-unused-command-line-argument");
+
+    build_c.define("_CRT_SECURE_NO_WARNINGS", None);
+    build_c.include(chiavdf_src);
+    build_c.include(&mpir_dir);
+    build_c.file(&lzcnt_c);
+    build_c.compile("chiavdf_fastc_lzcnt_c");
+
     println!("cargo:rustc-link-search=native={}", mpir_dir.display());
     println!("cargo:rustc-link-lib=mpir");
 }
 
-/// Build the portable "slow" fallback on macOS ARM (Apple Silicon). The full
-/// chiavdf fast engine uses x86 intrinsics/assembly and is not available there.
 fn build_macos_arm_fallback(manifest_dir: &PathBuf, chiavdf_src: &PathBuf) {
     let fallback_cpp = manifest_dir.join("native").join("chiavdf_fast_fallback.cpp");
     let lzcnt_c = chiavdf_src.join("refcode").join("lzcnt.c");
@@ -204,7 +218,6 @@ fn build_macos_arm_fallback(manifest_dir: &PathBuf, chiavdf_src: &PathBuf) {
 
     let (gmp_cflags, gmp_link_search) = detect_gmp_paths();
 
-    // C++ fallback implementation (must not include lzcnt.c: see below).
     let mut build_cpp = cc::Build::new();
     build_cpp.cpp(true);
     build_cpp.flag("-std=c++17");
@@ -222,8 +235,6 @@ fn build_macos_arm_fallback(manifest_dir: &PathBuf, chiavdf_src: &PathBuf) {
     build_cpp.file(fallback_cpp);
     build_cpp.compile("chiavdf_fastc");
 
-    // lzcnt.c must be compiled as C (not C++) so has_lzcnt_hard, lzcnt64_soft,
-    // lzcnt64_hard keep C linkage and match Reducer.h's extern "C" declarations.
     cc::Build::new()
         .file(lzcnt_c)
         .flag("-O2")
@@ -238,16 +249,12 @@ fn build_macos_arm_fallback(manifest_dir: &PathBuf, chiavdf_src: &PathBuf) {
     println!("cargo:rustc-link-lib=c++");
 }
 
-/// Detect GMP include path so the compiler can find `<gmp.h>` and `<gmpxx.h>`.
-/// Returns (cflags, optional lib dir for link search). Both are None if system defaults work.
 fn detect_gmp_paths() -> (Option<String>, Option<PathBuf>) {
-    // Prefer pkg-config (works on macOS with Homebrew and many Linux distros).
     for pkg in ["gmpxx", "gmp"] {
         if let Ok(output) = Command::new("pkg-config").args(["--cflags", pkg]).output() {
             if output.status.success() {
                 let cflags = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !cflags.is_empty() {
-                    // Optionally get lib dir for link search (e.g. Homebrew's path).
                     let lib_dir = Command::new("pkg-config")
                         .args(["--variable=libdir", pkg])
                         .output()
@@ -267,7 +274,6 @@ fn detect_gmp_paths() -> (Option<String>, Option<PathBuf>) {
         }
     }
 
-    // On macOS, Homebrew installs GMP to /opt/homebrew (Apple Silicon) or /usr/local (Intel).
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         if let Ok(output) = Command::new("brew").args(["--prefix", "gmp"]).output() {
             if output.status.success() {
@@ -284,7 +290,6 @@ fn detect_gmp_paths() -> (Option<String>, Option<PathBuf>) {
                 }
             }
         }
-        // Fallback: common Homebrew paths (avoid calling brew if not in PATH).
         for prefix in ["/opt/homebrew", "/usr/local"] {
             let prefix_path = PathBuf::from(prefix);
             let gmpxx = prefix_path.join("include").join("gmpxx.h");
@@ -300,7 +305,6 @@ fn detect_gmp_paths() -> (Option<String>, Option<PathBuf>) {
     (None, None)
 }
 
-/// Boost include path on macOS (Homebrew). Full chiavdf build needs <boost/asio.hpp>.
 fn detect_boost_include() -> Option<String> {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return None;
@@ -308,13 +312,24 @@ fn detect_boost_include() -> Option<String> {
     if let Ok(output) = Command::new("brew").args(["--prefix", "boost"]).output() {
         if output.status.success() {
             let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !prefix.is_empty() && PathBuf::from(&prefix).join("include").join("boost").join("asio.hpp").exists() {
+            if !prefix.is_empty()
+                && PathBuf::from(&prefix)
+                    .join("include")
+                    .join("boost")
+                    .join("asio.hpp")
+                    .exists()
+            {
                 return Some(format!("-I{}/include", prefix));
             }
         }
     }
     for prefix in ["/opt/homebrew", "/usr/local"] {
-        if PathBuf::from(prefix).join("include").join("boost").join("asio.hpp").exists() {
+        if PathBuf::from(prefix)
+            .join("include")
+            .join("boost")
+            .join("asio.hpp")
+            .exists()
+        {
             return Some(format!("-I{}/include", prefix));
         }
     }
