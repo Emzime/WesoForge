@@ -34,6 +34,7 @@ WesoForge
 		│   |	├── ffi.rs
 		│   |	└── lib.rs
 		│   |
+		|	├── build.rs
 		│   └── Cargo.toml
 		│
 		├── client/
@@ -61,15 +62,9 @@ WesoForge
 		│   ├── src
 		│   |	├── api.rs
 		│   |	├── backend.rs
-		│   |	├── cpu_affinity.rs
-		│   |	├── cuda_backend.rs
 		│   |	├── engine.rs
-		│   |	├── gpu.rs
-		│   |	├── gpu_detect.rs
-		│   |	├── gpu_manager.rs
 		│   |	├── inflight.rs
 		│   |	├── lib.rs
-		│   |	├── opencl_backend.rs
 		│   |	└── worker.rs
 		│   |
 		│   └── Cargo.toml

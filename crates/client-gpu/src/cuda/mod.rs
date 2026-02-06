@@ -63,6 +63,18 @@ pub(crate) fn run_spin_kernel(num_iterations: u64) -> Result<(), String> {
     let d_buf = unsafe { DeviceBuffer::<u32>::uninitialized(len as usize) }
         .map_err(|e| format!("{e}"))?;
 
+    // IMPORTANT: pass raw device pointers to kernels.
+    //
+    // On some `cust` versions / platforms, `DevicePointer<T>` can have a host-side size
+    // that differs from 8 bytes (e.g. it may include an extra marker field). The `launch!`
+    // macro packs kernel arguments by copying their raw bytes into an internal parameter
+    // buffer; if the argument type size doesn't match what the packer expects for a
+    // pointer-sized value, it can panic with:
+    // "destination and source slices have different lengths".
+    //
+    // Our PTX expects `.param .u64 buf_ptr`, so we pass the underlying `u64` explicitly.
+    let d_ptr: u64 = d_buf.as_device_ptr().as_raw();
+
     let module = Module::from_ptx(PTX, &[]).map_err(|e| format!("{e}"))?;
     let init = module.get_function("init_kernel").map_err(|e| format!("{e}"))?;
     let spin = module.get_function("spin_kernel").map_err(|e| format!("{e}"))?;
@@ -73,22 +85,9 @@ pub(crate) fn run_spin_kernel(num_iterations: u64) -> Result<(), String> {
     let grid = (len + block - 1) / block;
 
     unsafe {
-        launch!(
-            init<<<grid, block, 0, stream>>>(
-                d_buf.as_device_ptr(),
-                len
-            )
-        )
-        .map_err(|e| format!("{e}"))?;
+        launch!(init<<<grid, block, 0, stream>>>(d_ptr, len)).map_err(|e| format!("{e}"))?;
 
-        launch!(
-            spin<<<grid, block, 0, stream>>>(
-                d_buf.as_device_ptr(),
-                iters,
-                len
-            )
-        )
-        .map_err(|e| format!("{e}"))?;
+        launch!(spin<<<grid, block, 0, stream>>>(d_ptr, iters, len)).map_err(|e| format!("{e}"))?;
     }
 
     stream.synchronize().map_err(|e| format!("{e}"))?;
