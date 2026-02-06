@@ -2,6 +2,9 @@
 #![deny(unreachable_pub)]
 
 //! GPU support crate (CUDA / OpenCL) for WesoForge.
+//!
+//! Phase 1 (CUDA): real CUDA execution plumbing (kernel launch) is implemented as a validation step.
+//! The VDF prover math still runs on CPU for correctness.
 
 mod detect;
 mod error;
@@ -16,7 +19,7 @@ pub use detect::{detect_devices, GpuApi, GpuDevice};
 pub use error::{ClientGpuError, GpuPreference};
 
 fn log_backend(msg: &str) {
-    println!("[client-gpu] {msg}");
+    eprintln!("[client-gpu] {msg}");
 }
 
 /// Auto-select GPU backend (CUDA/OpenCL) and run the chiavdf prover.
@@ -34,8 +37,9 @@ pub fn prove_one_weso_fast_streaming_auto(
         #[cfg(feature = "cuda")]
         {
             if let Ok(true) = cuda::is_available() {
-                log_backend("CUDA backend selected");
+                log_backend("CUDA available; running phase-1 kernel (plumbing validation)");
                 let _ctx = cuda::CudaContext::new().map_err(ClientGpuError::CudaInit)?;
+                cuda::run_spin_kernel(num_iterations).map_err(ClientGpuError::CudaInit)?;
             }
         }
     }
@@ -44,13 +48,13 @@ pub fn prove_one_weso_fast_streaming_auto(
         #[cfg(feature = "opencl")]
         {
             if let Ok(true) = opencl::is_available() {
-                log_backend("OpenCL backend selected");
+                log_backend("OpenCL available; (compute path not implemented yet), using CPU");
                 let _ctx = opencl::OpenClContext::new().map_err(ClientGpuError::OpenClInit)?;
             }
         }
     }
 
-    log_backend("CPU fallback backend selected");
+    log_backend("CPU prover (source of truth) running");
     bbr_client_chiavdf_fast::prove_one_weso_fast_streaming(
         challenge_hash,
         x_s,
@@ -81,8 +85,9 @@ where
         #[cfg(feature = "cuda")]
         {
             if let Ok(true) = cuda::is_available() {
-                log_backend("CUDA backend selected (with progress)");
+                log_backend("CUDA available; running phase-1 kernel (plumbing validation) [with progress]");
                 let _ctx = cuda::CudaContext::new().map_err(ClientGpuError::CudaInit)?;
+                cuda::run_spin_kernel(num_iterations).map_err(ClientGpuError::CudaInit)?;
             }
         }
     }
@@ -91,13 +96,13 @@ where
         #[cfg(feature = "opencl")]
         {
             if let Ok(true) = opencl::is_available() {
-                log_backend("OpenCL backend selected (with progress)");
+                log_backend("OpenCL available; (compute path not implemented yet) [with progress], using CPU");
                 let _ctx = opencl::OpenClContext::new().map_err(ClientGpuError::OpenClInit)?;
             }
         }
     }
 
-    log_backend("CPU fallback backend selected (with progress)");
+    log_backend("CPU prover (source of truth) running [with progress]");
     bbr_client_chiavdf_fast::prove_one_weso_fast_streaming_with_progress(
         challenge_hash,
         x_s,
