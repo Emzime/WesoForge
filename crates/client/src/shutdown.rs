@@ -14,13 +14,6 @@ pub enum ShutdownEvent {
     Immediate,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum ClientEvent {
-    Shutdown(ShutdownEvent),
-    /// Toggle a GPU device by its ordinal (1..=9). `0` toggles all.
-    ToggleGpuIndex(u8),
-}
-
 impl ShutdownController {
     pub fn new() -> Self {
         Self {
@@ -35,7 +28,7 @@ impl ShutdownController {
 
 pub fn spawn_ctrl_c_handler(
     shutdown: Arc<ShutdownController>,
-    event_tx: mpsc::UnboundedSender<ClientEvent>,
+    shutdown_tx: mpsc::UnboundedSender<ShutdownEvent>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -44,9 +37,9 @@ pub fn spawn_ctrl_c_handler(
             }
             let n = shutdown.bump_forced();
             if n == 1 {
-                let _ = event_tx.send(ClientEvent::Shutdown(ShutdownEvent::Graceful));
+                let _ = shutdown_tx.send(ShutdownEvent::Graceful);
             } else {
-                let _ = event_tx.send(ClientEvent::Shutdown(ShutdownEvent::Immediate));
+                let _ = shutdown_tx.send(ShutdownEvent::Immediate);
                 return;
             }
         }

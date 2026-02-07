@@ -83,15 +83,27 @@ pub struct Cli {
     #[arg(long, env = "BBR_BACKEND_URL", default_value_t = default_backend_url())]
     pub backend_url: Url,
 
-    /// Number of proof workers to run in parallel.
+    /// Number of CPU proof workers to run in parallel.
+    ///
+    /// Use 0 to disable CPU workers entirely (GPU-only run).
+    #[arg(
+        long = "cpu-workers",
+        env = "BBR_CPU_WORKERS",
+        default_value_t = default_parallel_proofs(),
+        value_parser = clap::value_parser!(u16).range(0..=512)
+    )]
+    pub cpu_workers: u16,
+
+    /// Backward-compatible alias for cpu workers.
+    ///
+    /// If provided, it overrides --cpu-workers.
     #[arg(
         short = 'p',
         long,
         env = "BBR_PARALLEL_PROOFS",
-        default_value_t = default_parallel_proofs(),
-        value_parser = clap::value_parser!(u16).range(1..=512)
+        value_parser = clap::value_parser!(u16).range(0..=512)
     )]
-    pub parallel: u16,
+    pub parallel: Option<u16>,
 
     #[arg(long, env = "BBR_NO_TUI", default_value_t = false)]
     pub no_tui: bool,
@@ -136,4 +148,10 @@ pub struct Cli {
     /// Run a local benchmark (e.g. `--bench 0`) and exit.
     #[arg(long, value_name = "ALGO")]
     pub bench: Option<u32>,
+}
+
+impl Cli {
+    pub fn effective_cpu_workers(&self) -> u16 {
+        self.parallel.unwrap_or(self.cpu_workers)
+    }
 }

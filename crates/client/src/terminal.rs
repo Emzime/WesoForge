@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::shutdown::{ClientEvent, ShutdownController, ShutdownEvent};
+use crate::shutdown::{ShutdownController, ShutdownEvent};
 
 #[cfg(unix)]
 fn enable_onlcr() -> anyhow::Result<()> {
@@ -32,7 +32,7 @@ pub struct TuiTerminal {
 impl TuiTerminal {
     pub fn enter(
         shutdown: Arc<ShutdownController>,
-        event_tx: mpsc::UnboundedSender<ClientEvent>,
+        shutdown_tx: mpsc::UnboundedSender<ShutdownEvent>,
     ) -> anyhow::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         #[cfg(unix)]
@@ -54,24 +54,13 @@ impl TuiTerminal {
                     continue;
                 };
                 if let Event::Key(key) = ev {
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         let n = shutdown.bump_forced();
                         if n == 1 {
-                            let _ = event_tx.send(ClientEvent::Shutdown(ShutdownEvent::Graceful));
+                            let _ = shutdown_tx.send(ShutdownEvent::Graceful);
                         } else {
-                            let _ = event_tx.send(ClientEvent::Shutdown(ShutdownEvent::Immediate));
-                        }
-                    }
-
-                    // GPU toggles: keys 0..=9
-                    if key.modifiers.is_empty() {
-                        if let KeyCode::Char(ch) = key.code {
-                            if ch.is_ascii_digit() {
-                                let idx = (ch as u8) - b'0';
-                                let _ = event_tx.send(ClientEvent::ToggleGpuIndex(idx));
-                            }
+                            let _ = shutdown_tx.send(ShutdownEvent::Immediate);
                         }
                     }
                 }

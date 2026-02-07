@@ -3,16 +3,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use reqwest::Url;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "support-devtools")]
 use tauri::Manager;
 
-use bbr_client_core::submitter::{SubmitterConfig, load_submitter_config, save_submitter_config};
-use bbr_client_engine::{EngineConfig, EngineEvent, EngineHandle, GpuConfig, GpuMode, StatusSnapshot, start_engine};
+use bbr_client_core::submitter::{load_submitter_config, save_submitter_config, SubmitterConfig};
+use bbr_client_engine::{start_engine, EngineConfig, EngineEvent, EngineHandle, GpuConfig, GpuMode, StatusSnapshot};
 
 struct GuiState {
     engine: Mutex<Option<EngineHandle>>,
@@ -37,8 +37,48 @@ impl Default for GuiState {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GpuModeOpt {
+    Off,
+    Auto,
+    Cuda,
+    Opencl,
+}
+
+impl From<GpuModeOpt> for GpuMode {
+    fn from(value: GpuModeOpt) -> Self {
+        match value {
+            GpuModeOpt::Off => GpuMode::Off,
+            GpuModeOpt::Auto => GpuMode::Auto,
+            GpuModeOpt::Cuda => GpuMode::Cuda,
+            GpuModeOpt::Opencl => GpuMode::OpenCl,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct StartOptions {
+    /// Backward-compatible name already used by the UI.
+    /// If provided, it sets cpu_workers.
     parallel: Option<u32>,
+
+    /// Number of CPU workers. 0 disables CPU workers.
+    cpu_workers: Option<u32>,
+
+    /// GPU mode. If omitted, defaults to Off (unless WESOFORGE_GPU env overrides).
+    gpu_mode: Option<GpuModeOpt>,
+
+    /// GPU workers per detected device.
+    gpu_workers_per_device: Option<u32>,
+
+    /// Optional allow list of device keys (e.g. ["cuda:0","opencl:1"]).
+    gpu_allow: Option<Vec<String>>,
+
+    /// Optional deny list of device keys.
+    gpu_deny: Option<Vec<String>>,
+
+    /// Optional list of device keys that should start disabled.
+    gpu_start_disabled: Option<Vec<String>>,
 }
 
 #[cfg(feature = "prod-backend")]
@@ -59,6 +99,19 @@ fn default_backend_url() -> Url {
 const GUI_PROGRESS_STEPS: u64 = 200;
 const GUI_PROGRESS_TICK: Duration = Duration::from_millis(100);
 
+fn apply_legacy_env_override(cfg: &mut GpuConfig) {
+    // Legacy env override: WESOFORGE_GPU=cuda|opencl|auto|off
+    if let Ok(v) = std::env::var("WESOFORGE_GPU") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "cuda" => cfg.mode = GpuMode::Cuda,
+            "opencl" => cfg.mode = GpuMode::OpenCl,
+            "auto" | "1" | "true" | "yes" => cfg.mode = GpuMode::Auto,
+            "off" | "0" | "false" | "no" => cfg.mode = GpuMode::Off,
+            _ => {}
+        }
+    }
+}
+
 #[tauri::command]
 async fn get_submitter_config() -> Result<Option<SubmitterConfig>, String> {
     load_submitter_config().map_err(|e| format!("{e:#}"))
@@ -76,11 +129,7 @@ async fn engine_progress(state: State<'_, Arc<GuiState>>) -> Result<Vec<WorkerPr
 }
 
 #[tauri::command]
-async fn start_client(
-    app: AppHandle,
-    state: State<'_, Arc<GuiState>>,
-    opts: StartOptions,
-) -> Result<(), String> {
+async fn start_client(app: AppHandle, state: State<'_, Arc<GuiState>>, opts: StartOptions) -> Result<(), String> {
     let mut guard = state.engine.lock().await;
     if guard.is_some() {
         return Err("already running".to_string());
@@ -93,28 +142,48 @@ async fn start_client(
         Err(err) => return Err(format!("{err:#}")),
     };
 
-    let parallel = opts.parallel.unwrap_or(4);
-    if !(1..=512).contains(&parallel) {
-        return Err("Parallel workers must be between 1 and 512.".to_string());
+    // cpu_workers selection:
+    // - cpu_workers has priority
+    // - then legacy "parallel"
+    // - then default 4
+    let cpu_workers = opts
+        .cpu_workers
+        .or(opts.parallel)
+        .unwrap_or(4);
+
+    if cpu_workers > 512 {
+        return Err("cpu_workers must be between 0 and 512.".to_string());
     }
-    let parallel = parallel as usize;
+    let cpu_workers = cpu_workers as usize;
+
+    let mut gpu_cfg = GpuConfig::default();
+
+    if let Some(mode) = opts.gpu_mode.clone() {
+        gpu_cfg.mode = mode.into();
+    }
+    if let Some(n) = opts.gpu_workers_per_device {
+        if !(1..=64).contains(&n) {
+            return Err("gpu_workers_per_device must be between 1 and 64.".to_string());
+        }
+        gpu_cfg.workers_per_device = n as usize;
+    }
+    if let Some(v) = opts.gpu_allow.clone() {
+        gpu_cfg.allow = v;
+    }
+    if let Some(v) = opts.gpu_deny.clone() {
+        gpu_cfg.deny = v;
+    }
+    if let Some(v) = opts.gpu_start_disabled.clone() {
+        gpu_cfg.start_disabled = v;
+    }
+
+    // Keep env override for compatibility with existing scripts.
+    apply_legacy_env_override(&mut gpu_cfg);
 
     let engine = start_engine(EngineConfig {
         backend_url: default_backend_url(),
-        parallel,
-        gpu: {
-            let mut cfg = GpuConfig::default();
-            match std::env::var("WESOFORGE_GPU") {
-                Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-                    "cuda" => cfg.mode = GpuMode::Cuda,
-                    "opencl" => cfg.mode = GpuMode::OpenCl,
-                    "auto" | "1" | "true" | "yes" => cfg.mode = GpuMode::Auto,
-                    _ => {}
-                },
-                Err(_) => {}
-            }
-            cfg
-        },
+        parallel: cpu_workers,
+        gpu: gpu_cfg,
         mem_budget_bytes: 128 * 1024 * 1024,
         submitter,
         idle_sleep: Duration::ZERO,
@@ -129,8 +198,8 @@ async fn start_client(
     {
         let mut progress = state.progress.lock().await;
         progress.clear();
-        progress.reserve(parallel);
-        for worker_idx in 0..parallel {
+        progress.reserve(cpu_workers);
+        for worker_idx in 0..cpu_workers {
             progress.push(WorkerProgressUpdate {
                 worker_idx,
                 iters_done: 0,
@@ -139,6 +208,7 @@ async fn start_client(
             });
         }
     }
+
     tokio::spawn(async move {
         loop {
             let ev = match events.recv().await {
@@ -261,6 +331,34 @@ async fn engine_snapshot(state: State<'_, Arc<GuiState>>) -> Result<Option<Statu
     Ok(guard.as_ref().map(|engine| engine.snapshot()))
 }
 
+#[tauri::command]
+async fn set_worker_enabled(
+    state: State<'_, Arc<GuiState>>,
+    worker_idx: usize,
+    enabled: bool,
+) -> Result<(), String> {
+    let guard = state.engine.lock().await;
+    let Some(engine) = guard.as_ref() else {
+        return Err("not running".to_string());
+    };
+    engine.set_worker_enabled(worker_idx, enabled);
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_gpu_enabled(
+    state: State<'_, Arc<GuiState>>,
+    device_key: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let guard = state.engine.lock().await;
+    let Some(engine) = guard.as_ref() else {
+        return Err("not running".to_string());
+    };
+    engine.set_gpu_enabled(&device_key, enabled);
+    Ok(())
+}
+
 fn main() {
     #[cfg(target_os = "linux")]
     {
@@ -295,7 +393,9 @@ fn main() {
             start_client,
             stop_client,
             client_running,
-            engine_snapshot
+            engine_snapshot,
+            set_worker_enabled,
+            set_gpu_enabled
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

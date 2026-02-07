@@ -260,6 +260,7 @@ pub(crate) async fn compute_witness(
         let output = output.clone();
         let progress_clone = progress.clone();
 
+        let worker_kind = worker_kind.clone();
         let compute = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, bool)> {
             let x = default_classgroup_element();
             let out = match &worker_kind {

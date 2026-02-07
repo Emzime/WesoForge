@@ -24,8 +24,6 @@ pub struct GpuDevice {
 ///
 /// If features are disabled, returns an empty list for that backend.
 pub fn detect_devices() -> Vec<GpuDevice> {
-    // When no GPU features are enabled, this vector is never mutated and Rust warns on `mut`.
-    // We keep `mut` to support appending devices when features are enabled.
     #[allow(unused_mut)]
     let mut out = Vec::new();
 
