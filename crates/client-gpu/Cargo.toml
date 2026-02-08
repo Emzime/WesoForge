@@ -3,24 +3,14 @@ name = "bbr-client-gpu"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-path = "src/lib.rs"
+[features]
+# Enable NVIDIA CUDA backend (driver API via dynamic loading).
+cuda = []
+# Enable OpenCL backend (dynamic loading).
+opencl = []
 
 [dependencies]
-thiserror = { workspace = true }
-
-# CPU fallback glue used by the GPU "plumbing validation" path (source of truth)
+anyhow = { workspace = true }
+libloading = { workspace = true }
+bbr-client-core = { path = "../client-core" }
 bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
-
-# CUDA backend
-cust = { version = "0.3", optional = true }
-
-# OpenCL backend
-opencl3 = { version = "0.9", optional = true }
-
-[features]
-default = []
-
-cuda = ["dep:cust"]
-opencl = ["dep:opencl3"]
-gpu = ["cuda", "opencl"]

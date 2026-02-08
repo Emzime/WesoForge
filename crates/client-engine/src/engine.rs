@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,25 +9,21 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::api::{
-    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, StatusSnapshot, WorkerKind,
+    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, PinMode, StatusSnapshot,
     WorkerSnapshot, WorkerStage,
 };
-use crate::backend::{BackendJobDto, BackendWorkBatch, fetch_work};
+use crate::backend::{
+    BackendJobDto, BackendWorkBatch, BackendWorkGroup, fetch_batch_work, fetch_work,
+};
 use crate::inflight::InflightStore;
+use crate::pinning::PinningPlan;
 use crate::worker::{WorkerCommand, WorkerInternalEvent};
-
-use bbr_client_gpu::{detect_devices, GpuApi};
 
 pub(crate) struct EngineInner {
     pub(crate) event_tx: broadcast::Sender<EngineEvent>,
     pub(crate) snapshot_rx: watch::Receiver<StatusSnapshot>,
     stop_requested: AtomicBool,
     notify: tokio::sync::Notify,
-
-    // Shared worker enable flags (set by run_engine).
-    worker_enabled: std::sync::Mutex<Vec<Arc<AtomicBool>>>,
-    // Map of GPU device_key -> worker indices.
-    gpu_worker_map: std::sync::Mutex<std::collections::HashMap<String, Vec<usize>>>,
 }
 
 impl EngineInner {
@@ -41,35 +37,6 @@ impl EngineInner {
     fn should_stop(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
     }
-
-    pub(crate) fn set_worker_enabled(&self, worker_idx: usize, enabled: bool) {
-        let list = self.worker_enabled.lock().unwrap();
-        if let Some(flag) = list.get(worker_idx) {
-            flag.store(enabled, Ordering::SeqCst);
-            let _ = self
-                .event_tx
-                .send(EngineEvent::WorkerEnabled { worker_idx, enabled });
-        }
-    }
-
-    pub(crate) fn set_gpu_enabled(&self, device_key: &str, enabled: bool) {
-        let map = self.gpu_worker_map.lock().unwrap();
-        if let Some(indices) = map.get(device_key) {
-            let list = self.worker_enabled.lock().unwrap();
-            for &idx in indices {
-                if let Some(flag) = list.get(idx) {
-                    flag.store(enabled, Ordering::SeqCst);
-                    let _ = self
-                        .event_tx
-                        .send(EngineEvent::WorkerEnabled { worker_idx: idx, enabled });
-                }
-            }
-            let _ = self.event_tx.send(EngineEvent::GpuEnabled {
-                device_key: device_key.to_string(),
-                enabled,
-            });
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -80,14 +47,49 @@ struct WorkJobItem {
 }
 
 #[derive(Debug)]
+enum WorkItem {
+    Job(WorkJobItem),
+    Group(BackendWorkGroup),
+}
+
+#[derive(Debug)]
+enum WorkProgress {
+    Single { total_iters: u64 },
+    Group { per_job_iters: Vec<u64> },
+}
+
+impl WorkProgress {
+    fn squaring_total_iters(&self) -> u64 {
+        match self {
+            WorkProgress::Single { total_iters } => *total_iters,
+            WorkProgress::Group { per_job_iters } => {
+                per_job_iters.iter().copied().max().unwrap_or(0)
+            }
+        }
+    }
+
+    fn effective_iters_done(&self, squaring_iters_done: u64) -> u64 {
+        match self {
+            WorkProgress::Single { .. } => squaring_iters_done,
+            WorkProgress::Group { per_job_iters } => per_job_iters
+                .iter()
+                .copied()
+                .map(|job_iters| job_iters.min(squaring_iters_done))
+                .sum(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct WorkerRuntime {
     stage: WorkerStage,
     job: Option<JobSummary>,
-    iters_total: u64,
-    last_speed_sample_at: Option<Instant>,
-    prev_speed_interval: Option<(u64, Duration)>,
+    group_id: Option<u64>,
+    work: Option<WorkProgress>,
+    compute_started_at: Option<Instant>,
     speed_its_per_sec: u64,
-    last_reported_iters_done: u64,
+    last_reported_squaring_iters_done: u64,
+    last_reported_effective_iters_done: u64,
     last_emitted_iters_done: u64,
 }
 
@@ -96,11 +98,12 @@ impl WorkerRuntime {
         Self {
             stage: WorkerStage::Idle,
             job: None,
-            iters_total: 0,
-            last_speed_sample_at: None,
-            prev_speed_interval: None,
+            group_id: None,
+            work: None,
+            compute_started_at: None,
             speed_its_per_sec: 0,
-            last_reported_iters_done: 0,
+            last_reported_squaring_iters_done: 0,
+            last_reported_effective_iters_done: 0,
             last_emitted_iters_done: 0,
         }
     }
@@ -116,11 +119,26 @@ impl WorkerRuntime {
     fn start_job(&mut self, job: JobSummary) {
         self.stage = WorkerStage::Computing;
         self.job = Some(job.clone());
-        self.iters_total = job.number_of_iterations;
-        self.last_speed_sample_at = Some(Instant::now());
-        self.prev_speed_interval = None;
+        self.group_id = None;
+        self.work = Some(WorkProgress::Single {
+            total_iters: job.number_of_iterations,
+        });
+        self.compute_started_at = Some(Instant::now());
         self.speed_its_per_sec = 0;
-        self.last_reported_iters_done = 0;
+        self.last_reported_squaring_iters_done = 0;
+        self.last_reported_effective_iters_done = 0;
+        self.last_emitted_iters_done = 0;
+    }
+
+    fn start_group(&mut self, group_id: u64, display_job: JobSummary, per_job_iters: Vec<u64>) {
+        self.stage = WorkerStage::Computing;
+        self.job = Some(display_job);
+        self.group_id = Some(group_id);
+        self.work = Some(WorkProgress::Group { per_job_iters });
+        self.compute_started_at = Some(Instant::now());
+        self.speed_its_per_sec = 0;
+        self.last_reported_squaring_iters_done = 0;
+        self.last_reported_effective_iters_done = 0;
         self.last_emitted_iters_done = 0;
     }
 
@@ -131,45 +149,47 @@ impl WorkerRuntime {
     fn finish_job(&mut self) {
         self.stage = WorkerStage::Idle;
         self.job = None;
-        self.iters_total = 0;
-        self.last_speed_sample_at = None;
-        self.prev_speed_interval = None;
+        self.group_id = None;
+        self.work = None;
+        self.compute_started_at = None;
         self.speed_its_per_sec = 0;
-        self.last_reported_iters_done = 0;
+        self.last_reported_squaring_iters_done = 0;
+        self.last_reported_effective_iters_done = 0;
         self.last_emitted_iters_done = 0;
     }
 
     fn apply_progress(&mut self, iters_done: u64) -> Option<u64> {
-        let total_iters = self.iters_total;
+        let Some(work) = &self.work else {
+            return None;
+        };
+        let total_iters = work.squaring_total_iters();
         if total_iters == 0 {
             return None;
         }
 
         let now = Instant::now();
         let iters_done = iters_done.min(total_iters);
-        let delta = iters_done.saturating_sub(self.last_reported_iters_done);
-        if delta == 0 {
+        let effective_done = work.effective_iters_done(iters_done);
+        let delta_effective =
+            effective_done.saturating_sub(self.last_reported_effective_iters_done);
+        let delta_squaring = iters_done.saturating_sub(self.last_reported_squaring_iters_done);
+        if delta_squaring == 0 && delta_effective == 0 {
             return None;
         }
 
-        if let Some(last_at) = self.last_speed_sample_at {
-            let dt = now.duration_since(last_at);
-            let (total_iters, total_dt) = if let Some((prev_iters, prev_dt)) = self.prev_speed_interval
-            {
-                (prev_iters.saturating_add(delta), prev_dt + dt)
-            } else {
-                (delta, dt)
-            };
-
-            if total_dt.as_secs_f64() > 0.0 {
-                self.speed_its_per_sec = (total_iters as f64 / total_dt.as_secs_f64()).round() as u64;
+        if let Some(started_at) = self.compute_started_at {
+            let elapsed = now.duration_since(started_at);
+            if elapsed.as_secs_f64() > 0.0 {
+                self.speed_its_per_sec =
+                    (effective_done as f64 / elapsed.as_secs_f64()).round() as u64;
             }
-            self.prev_speed_interval = Some((delta, dt));
         }
-
-        self.last_speed_sample_at = Some(now);
-        self.last_reported_iters_done = iters_done;
-        Some(iters_done)
+        self.last_reported_squaring_iters_done = iters_done;
+        self.last_reported_effective_iters_done = effective_done;
+        if delta_squaring > 0 {
+            return Some(iters_done);
+        }
+        None
     }
 }
 
@@ -178,15 +198,13 @@ struct EngineRuntime {
     cfg: EngineConfig,
 
     workers: Vec<WorkerRuntime>,
-    worker_kinds: Vec<WorkerKind>,
-    worker_enabled: Vec<Arc<AtomicBool>>,
     worker_cmds: Vec<mpsc::Sender<WorkerCommand>>,
     worker_progress: Vec<Arc<std::sync::atomic::AtomicU64>>,
     internal_rx: mpsc::UnboundedReceiver<WorkerInternalEvent>,
     worker_join: JoinSet<()>,
 
-    pending: VecDeque<WorkJobItem>,
-    fetch_task: Option<tokio::task::JoinHandle<anyhow::Result<Vec<WorkJobItem>>>>,
+    pending: VecDeque<WorkItem>,
+    fetch_task: Option<tokio::task::JoinHandle<anyhow::Result<Vec<WorkItem>>>>,
     fetch_backoff: Option<Pin<Box<tokio::time::Sleep>>>,
     inflight: Option<InflightStore>,
 
@@ -203,16 +221,6 @@ impl EngineRuntime {
             .enumerate()
             .map(|(idx, w)| WorkerSnapshot {
                 worker_idx: idx,
-                worker_kind: self
-                    .worker_kinds
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or(WorkerKind::Cpu),
-                enabled: self
-                    .worker_enabled
-                    .get(idx)
-                    .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-                    .unwrap_or(true),
                 stage: w.stage,
                 job: w.job.clone(),
                 iters_done: self
@@ -220,7 +228,11 @@ impl EngineRuntime {
                     .get(idx)
                     .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
                     .unwrap_or(0),
-                iters_total: w.iters_total,
+                iters_total: w
+                    .work
+                    .as_ref()
+                    .map(|p| p.squaring_total_iters())
+                    .unwrap_or(0),
                 iters_per_sec: w.speed_its_per_sec,
             })
             .collect();
@@ -242,18 +254,7 @@ impl EngineRuntime {
     }
 
     fn idle_count(&self) -> usize {
-        self.workers
-            .iter()
-            .enumerate()
-            .filter(|(idx, w)| {
-                w.is_idle()
-                    && self
-                        .worker_enabled
-                        .get(*idx)
-                        .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-                        .unwrap_or(true)
-            })
-            .count()
+        self.workers.iter().filter(|w| w.is_idle()).count()
     }
 
     fn all_idle(&self) -> bool {
@@ -274,17 +275,27 @@ impl EngineRuntime {
 
         let http = self.http.clone();
         let backend = self.cfg.backend_url.clone();
+        let use_groups = self.cfg.use_groups;
+        // Only lease as many groups as needed to fill currently idle workers.
+        let group_count = count.min(32) as u32;
         let count = count;
         self.fetch_task = Some(tokio::spawn(async move {
+            if use_groups {
+                let groups = fetch_batch_work(&http, &backend, group_count).await?;
+                return Ok(groups.into_iter().map(WorkItem::Group).collect());
+            }
+
             let count = count.min(u32::MAX as usize) as u32;
             let batch: BackendWorkBatch = fetch_work(&http, &backend, count).await?;
             let items = batch
                 .jobs
                 .into_iter()
-                .map(|job| WorkJobItem {
-                    lease_id: batch.lease_id.clone(),
-                    lease_expires_at: batch.lease_expires_at,
-                    job,
+                .map(|job| {
+                    WorkItem::Job(WorkJobItem {
+                        lease_id: batch.lease_id.clone(),
+                        lease_expires_at: batch.lease_expires_at,
+                        job,
+                    })
                 })
                 .collect();
             Ok(items)
@@ -302,29 +313,73 @@ impl EngineRuntime {
             if !self.workers[idx].is_idle() {
                 continue;
             }
-
-            if !self
-                .worker_enabled
-                .get(idx)
-                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(true)
-            {
-                continue;
-            }
             let Some(item) = self.pending.pop_front() else {
                 break;
             };
 
-            let job_summary = JobSummary {
-                job_id: item.job.job_id,
-                height: item.job.height,
-                field_vdf: item.job.field_vdf,
-                number_of_iterations: item.job.number_of_iterations,
+            let (job_summary, cmd, group_info): (
+                JobSummary,
+                WorkerCommand,
+                Option<(u64, Vec<u64>)>,
+            ) = match item {
+                WorkItem::Job(item) => {
+                    let job_summary = JobSummary {
+                        job_id: item.job.job_id,
+                        group_proofs: None,
+                        height: item.job.height,
+                        field_vdf: item.job.field_vdf,
+                        number_of_iterations: item.job.number_of_iterations,
+                    };
+
+                    let cmd = WorkerCommand::Job {
+                        worker_idx: idx,
+                        backend_url: self.cfg.backend_url.clone(),
+                        lease_id: item.lease_id,
+                        lease_expires_at: item.lease_expires_at,
+                        job: item.job,
+                        progress_steps: self.cfg.progress_steps,
+                    };
+
+                    (job_summary, cmd, None)
+                }
+                WorkItem::Group(group) => {
+                    let group_id = group.group_id;
+                    let group_iters: Vec<u64> =
+                        group.jobs.iter().map(|j| j.number_of_iterations).collect();
+                    let total_iters = group_iters.iter().copied().max().unwrap_or(0);
+                    let Some(first) = group.jobs.first() else {
+                        continue;
+                    };
+
+                    let job_summary = JobSummary {
+                        job_id: first.job_id,
+                        group_proofs: Some(group.jobs.len() as u32),
+                        height: first.height,
+                        field_vdf: first.field_vdf,
+                        number_of_iterations: total_iters,
+                    };
+
+                    let cmd = WorkerCommand::Group {
+                        worker_idx: idx,
+                        backend_url: self.cfg.backend_url.clone(),
+                        lease_id: group.lease_id,
+                        lease_expires_at: group.lease_expires_at,
+                        group_id: group.group_id,
+                        jobs: group.jobs,
+                        progress_steps: self.cfg.progress_steps,
+                    };
+
+                    (job_summary, cmd, Some((group_id, group_iters)))
+                }
             };
 
             {
                 let worker = &mut self.workers[idx];
-                worker.start_job(job_summary.clone());
+                if let Some((group_id, group_iters)) = group_info {
+                    worker.start_group(group_id, job_summary.clone(), group_iters);
+                } else {
+                    worker.start_job(job_summary.clone());
+                }
             }
             if let Some(a) = self.worker_progress.get(idx) {
                 a.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -338,15 +393,6 @@ impl EngineRuntime {
                 stage: WorkerStage::Computing,
             });
             snapshot_dirty = true;
-
-            let cmd = WorkerCommand::Job {
-                worker_idx: idx,
-                backend_url: self.cfg.backend_url.clone(),
-                lease_id: item.lease_id,
-                lease_expires_at: item.lease_expires_at,
-                job: item.job,
-                progress_steps: self.cfg.progress_steps,
-            };
 
             self.worker_cmds
                 .get(idx)
@@ -365,7 +411,7 @@ impl EngineRuntime {
 
     async fn handle_fetch_result(
         &mut self,
-        res: Result<anyhow::Result<Vec<WorkJobItem>>, tokio::task::JoinError>,
+        res: Result<anyhow::Result<Vec<WorkItem>>, tokio::task::JoinError>,
     ) {
         self.fetch_task = None;
 
@@ -375,21 +421,57 @@ impl EngineRuntime {
                     if let Some(store) = &mut self.inflight {
                         let mut changed = false;
                         for item in &items {
-                            changed |= store.insert_job(
-                                item.lease_id.clone(),
-                                item.lease_expires_at,
-                                item.job.clone(),
-                            );
+                            match item {
+                                WorkItem::Job(item) => {
+                                    changed |= store.insert_job(
+                                        item.lease_id.clone(),
+                                        item.lease_expires_at,
+                                        item.job.clone(),
+                                    );
+                                }
+                                WorkItem::Group(group) => {
+                                    changed |= store.insert_group(
+                                        group.group_id,
+                                        group.lease_id.clone(),
+                                        group.lease_expires_at,
+                                        group.jobs.clone(),
+                                    );
+                                }
+                            }
                         }
                         if changed {
                             if let Err(err) = store.persist().await {
                                 self.emit(EngineEvent::Warning {
-                                    message: format!("warning: failed to persist inflight leases: {err:#}"),
+                                    message: format!(
+                                        "warning: failed to persist inflight leases: {err:#}"
+                                    ),
                                 });
                             }
                         }
                     }
-                    self.pending.extend(items);
+
+                    if self.cfg.use_groups {
+                        let mut seen_groups: HashSet<u64> =
+                            self.workers.iter().filter_map(|w| w.group_id).collect();
+                        for item in &self.pending {
+                            if let WorkItem::Group(group) = item {
+                                seen_groups.insert(group.group_id);
+                            }
+                        }
+
+                        for item in items {
+                            match item {
+                                WorkItem::Group(group) => {
+                                    if seen_groups.insert(group.group_id) {
+                                        self.pending.push_back(WorkItem::Group(group));
+                                    }
+                                }
+                                other => self.pending.push_back(other),
+                            }
+                        }
+                    } else {
+                        self.pending.extend(items);
+                    }
                 }
                 if self.pending.is_empty() {
                     self.fetch_backoff = Some(Box::pin(tokio::time::sleep(self.cfg.idle_sleep)));
@@ -419,8 +501,10 @@ impl EngineRuntime {
                 self.emit(EngineEvent::WorkerStage { worker_idx, stage });
                 self.push_snapshot();
             }
-            WorkerInternalEvent::Finished { outcome } => {
-                let worker_idx = outcome.worker_idx;
+            WorkerInternalEvent::WorkFinished {
+                worker_idx,
+                outcomes,
+            } => {
                 if let Some(worker) = self.workers.get_mut(worker_idx) {
                     worker.finish_job();
                 }
@@ -428,24 +512,37 @@ impl EngineRuntime {
                     a.store(0, Ordering::Relaxed);
                 }
 
-                self.recent_jobs.push_back(outcome.clone());
-                while self.recent_jobs.len() > self.cfg.recent_jobs_max.max(1) {
-                    self.recent_jobs.pop_front();
+                let mut remove_inflight_job_ids = Vec::new();
+                for outcome in outcomes {
+                    self.recent_jobs.push_back(outcome.clone());
+                    while self.recent_jobs.len() > self.cfg.recent_jobs_max.max(1) {
+                        self.recent_jobs.pop_front();
+                    }
+                    if outcome.drop_inflight
+                        || (outcome.error.is_none() && outcome.submit_reason.is_some())
+                    {
+                        remove_inflight_job_ids.push(outcome.job.job_id);
+                    }
+                    self.emit(EngineEvent::JobFinished { outcome });
                 }
 
-                if outcome.drop_inflight || (outcome.error.is_none() && outcome.submit_reason.is_some()) {
+                if !remove_inflight_job_ids.is_empty() {
                     if let Some(store) = &mut self.inflight {
-                        if store.remove_job(outcome.job.job_id) {
+                        let mut changed = false;
+                        for job_id in remove_inflight_job_ids {
+                            changed |= store.remove_job(job_id);
+                        }
+                        if changed {
                             if let Err(err) = store.persist().await {
                                 self.emit(EngineEvent::Warning {
-                                    message: format!("warning: failed to persist inflight leases: {err:#}"),
+                                    message: format!(
+                                        "warning: failed to persist inflight leases: {err:#}"
+                                    ),
                                 });
                             }
                         }
                     }
                 }
-
-                self.emit(EngineEvent::JobFinished { outcome });
                 self.push_snapshot();
             }
             WorkerInternalEvent::Warning { message } => {
@@ -477,7 +574,15 @@ impl EngineRuntime {
                     continue;
                 }
                 worker.last_emitted_iters_done = iters_done;
-                (iters_done, worker.iters_total, worker.speed_its_per_sec)
+                (
+                    iters_done,
+                    worker
+                        .work
+                        .as_ref()
+                        .map(|p| p.squaring_total_iters())
+                        .unwrap_or(0),
+                    worker.speed_its_per_sec,
+                )
             };
 
             self.emit(EngineEvent::WorkerProgress {
@@ -545,7 +650,7 @@ impl EngineRuntime {
                 res = async {
                     match self.fetch_task.as_mut() {
                         Some(task) => task.await,
-                        None => std::future::pending::<Result<anyhow::Result<Vec<WorkJobItem>>, tokio::task::JoinError>>().await,
+                        None => std::future::pending::<Result<anyhow::Result<Vec<WorkItem>>, tokio::task::JoinError>>().await,
                     }
                 } => {
                     self.handle_fetch_result(res).await;
@@ -607,9 +712,6 @@ pub(crate) fn start_engine(cfg: EngineConfig) -> EngineHandle {
         snapshot_rx,
         stop_requested: AtomicBool::new(false),
         notify: tokio::sync::Notify::new(),
-
-        worker_enabled: std::sync::Mutex::new(Vec::new()),
-        gpu_worker_map: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let join = tokio::spawn(run_engine(inner.clone(), snapshot_tx, cfg));
@@ -646,9 +748,9 @@ async fn run_engine(
         Ok(http) => http,
         Err(err) => {
             let message = format!("build http client: {err:#}");
-            let _ = inner
-                .event_tx
-                .send(EngineEvent::Error { message: message.clone() });
+            let _ = inner.event_tx.send(EngineEvent::Error {
+                message: message.clone(),
+            });
             let _ = inner.event_tx.send(EngineEvent::Stopped);
             let _ = snapshot_tx.send(StatusSnapshot {
                 stop_requested: inner.should_stop(),
@@ -662,79 +764,33 @@ async fn run_engine(
     let submitter = Arc::new(tokio::sync::RwLock::new(cfg.submitter.clone()));
     let warned_invalid_reward_address = Arc::new(AtomicBool::new(false));
 
-    let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
-
-    // Build worker specs: CPU workers first, then GPU workers (one or more per device).
-    let mut worker_kinds: Vec<WorkerKind> = Vec::new();
-    let mut worker_enabled: Vec<Arc<AtomicBool>> = Vec::new();
-    let mut gpu_worker_map: std::collections::HashMap<String, Vec<usize>> =
-        std::collections::HashMap::new();
-
-    for _ in 0..cfg.parallel {
-        worker_kinds.push(WorkerKind::Cpu);
-        worker_enabled.push(Arc::new(AtomicBool::new(true)));
-    }
-
-    // GPU devices are optional at build time.
-    let gpu_cfg = cfg.gpu.clone();
-    if gpu_cfg.mode != crate::api::GpuMode::Off {
-        let devices = detect_devices();
-        // Filter devices by mode.
-        for dev in devices {
-            let api_ok = match gpu_cfg.mode {
-                crate::api::GpuMode::Auto => true,
-                crate::api::GpuMode::Cuda => dev.api == GpuApi::Cuda,
-                crate::api::GpuMode::OpenCl => dev.api == GpuApi::OpenCl,
-                crate::api::GpuMode::Off => false,
-            };
-            if !api_ok {
-                continue;
-            }
-
-            let prefix = match dev.api {
-                GpuApi::Cuda => "cuda",
-                GpuApi::OpenCl => "opencl",
-            };
-            let device_key = format!("{prefix}:{}", dev.device_index);
-
-            if !gpu_cfg.allow.is_empty() && !gpu_cfg.allow.iter().any(|k| k == &device_key) {
-                continue;
-            }
-            if gpu_cfg.deny.iter().any(|k| k == &device_key) {
-                continue;
-            }
-
-            let start_enabled = !gpu_cfg.start_disabled.iter().any(|k| k == &device_key);
-
-            let workers_per_device = gpu_cfg.workers_per_device.max(1);
-            for _ in 0..workers_per_device {
-                let idx = worker_kinds.len();
-                worker_kinds.push(WorkerKind::Gpu {
-                    device_key: device_key.clone(),
-                    device_name: dev.name.clone(),
+    let pinning = Arc::new(PinningPlan::build(cfg.pin_mode));
+    match cfg.pin_mode {
+        PinMode::Off => {}
+        PinMode::L3 => {
+            if !cfg!(target_os = "linux") {
+                let _ = inner.event_tx.send(EngineEvent::Warning {
+                    message: "warning: --pin l3 is only supported on Linux; ignored.".to_string(),
                 });
-                worker_enabled.push(Arc::new(AtomicBool::new(start_enabled)));
-                gpu_worker_map.entry(device_key.clone()).or_default().push(idx);
+            } else if pinning.is_effective() {
+                let _ = inner.event_tx.send(EngineEvent::Warning {
+                    message: format!("CPU pinning enabled: l3 domains={}", pinning.domain_count()),
+                });
+            } else {
+                let _ = inner.event_tx.send(EngineEvent::Warning {
+                    message: "warning: --pin l3 requested, but no L3 shared-cpu domains were discovered; pinning disabled.".to_string(),
+                });
             }
         }
     }
 
-    // Publish enable flags + gpu map to the handle.
-    {
-        let mut list = inner.worker_enabled.lock().unwrap();
-        *list = worker_enabled.clone();
-        let mut map = inner.gpu_worker_map.lock().unwrap();
-        *map = gpu_worker_map;
-    }
+    let (internal_tx, internal_rx) = mpsc::unbounded_channel::<WorkerInternalEvent>();
 
-    let total_workers = worker_kinds.len();
-    let (mut worker_cmds, mut worker_progress, mut worker_join) = (
-        Vec::with_capacity(total_workers),
-        Vec::with_capacity(total_workers),
-        JoinSet::new(),
-    );
+    let mut worker_cmds = Vec::with_capacity(cfg.parallel);
+    let mut worker_progress = Vec::with_capacity(cfg.parallel);
+    let mut worker_join = JoinSet::new();
 
-    for worker_idx in 0..total_workers {
+    for worker_idx in 0..cfg.parallel {
         let (tx, rx) = mpsc::channel::<WorkerCommand>(1);
         worker_cmds.push(tx);
 
@@ -746,34 +802,31 @@ async fn run_engine(
         let warned = warned_invalid_reward_address.clone();
         let internal_tx = internal_tx.clone();
         let progress = progress.clone();
-
-        let kind = worker_kinds
-            .get(worker_idx)
-            .cloned()
-            .unwrap_or(WorkerKind::Cpu);
+        let pinning = pinning.clone();
 
         worker_join.spawn(async move {
             crate::worker::run_worker_task(
                 worker_idx,
-                kind,
                 rx,
                 internal_tx,
                 progress,
                 http,
                 submitter,
                 warned,
+                pinning,
             )
             .await;
         });
     }
 
-    let workers = (0..total_workers).map(|_| WorkerRuntime::new()).collect();
+    let workers = (0..cfg.parallel).map(|_| WorkerRuntime::new()).collect();
 
     let mut inflight = match InflightStore::load() {
         Ok(Some(store)) => Some(store),
         Ok(None) => None,
         Err(err) => {
-            let message = format!("warning: failed to load inflight leases (resume disabled): {err:#}");
+            let message =
+                format!("warning: failed to load inflight leases (resume disabled): {err:#}");
             let _ = inner.event_tx.send(EngineEvent::Warning { message });
             None
         }
@@ -781,45 +834,93 @@ async fn run_engine(
 
     if let Some(store) = inflight.as_mut() {
         let now = Utc::now().timestamp();
-        let expired_job_ids: Vec<u64> = store
-            .entries()
-            .filter(|entry| entry.lease_expires_at <= now)
-            .map(|entry| entry.job.job_id)
-            .collect();
+
+        let mut expired_job_ids: HashSet<u64> = HashSet::new();
+        for entry in store.job_entries() {
+            if entry.lease_expires_at <= now {
+                expired_job_ids.insert(entry.job.job_id);
+            }
+        }
+        for group in store.group_entries() {
+            if group.lease_expires_at <= now {
+                for job in &group.jobs {
+                    expired_job_ids.insert(job.job_id);
+                }
+            }
+        }
 
         if !expired_job_ids.is_empty() {
-            let expired_count = expired_job_ids.len();
+            let before = store.total_jobs();
             for job_id in expired_job_ids {
                 store.remove_job(job_id);
             }
+            let removed = before.saturating_sub(store.total_jobs());
+            if removed > 0 {
+                if let Err(err) = store.persist().await {
+                    let _ = inner.event_tx.send(EngineEvent::Warning {
+                        message: format!(
+                            "warning: failed to persist expired inflight lease cleanup: {err:#}"
+                        ),
+                    });
+                } else {
+                    let _ = inner.event_tx.send(EngineEvent::Warning {
+                        message: format!(
+                            "Discarded {removed} expired inflight lease(s) from previous run."
+                        ),
+                    });
+                }
+            }
+        }
 
+        if cfg.use_groups && store.promote_jobs_to_groups_by_challenge(4) {
+            let message =
+                "Migrated inflight proof leases into grouped work (resume will run groups)."
+                    .to_string();
+            let _ = inner.event_tx.send(EngineEvent::Warning { message });
             if let Err(err) = store.persist().await {
-                let _ = inner.event_tx.send(EngineEvent::Warning {
-                    message: format!("warning: failed to persist expired inflight lease cleanup: {err:#}"),
-                });
-            } else {
-                let _ = inner.event_tx.send(EngineEvent::Warning {
-                    message: format!(
-                        "Discarded {expired_count} expired inflight lease(s) from previous run."
-                    ),
-                });
+                let message =
+                    format!("warning: failed to persist migrated inflight leases: {err:#}");
+                let _ = inner.event_tx.send(EngineEvent::Warning { message });
             }
         }
     }
 
     let mut pending = VecDeque::new();
     if let Some(store) = inflight.as_ref() {
-        for entry in store.entries() {
-            pending.push_back(WorkJobItem {
+        if cfg.use_groups {
+            for group in store.group_entries() {
+                pending.push_back(WorkItem::Group(BackendWorkGroup {
+                    group_id: group.group_id,
+                    lease_id: group.lease_id.clone(),
+                    lease_expires_at: group.lease_expires_at,
+                    jobs: group.jobs.clone(),
+                }));
+            }
+        }
+
+        for entry in store.job_entries() {
+            pending.push_back(WorkItem::Job(WorkJobItem {
                 lease_id: entry.lease_id.clone(),
                 lease_expires_at: entry.lease_expires_at,
                 job: entry.job.clone(),
-            });
+            }));
+        }
+
+        if !cfg.use_groups {
+            for group in store.group_entries() {
+                for job in &group.jobs {
+                    pending.push_back(WorkItem::Job(WorkJobItem {
+                        lease_id: group.lease_id.clone(),
+                        lease_expires_at: group.lease_expires_at,
+                        job: job.clone(),
+                    }));
+                }
+            }
         }
         if !pending.is_empty() {
             let message = format!(
                 "Loaded {} inflight lease(s) from previous run; processing them before leasing new work.",
-                pending.len()
+                store.total_jobs()
             );
             let _ = inner.event_tx.send(EngineEvent::Warning { message });
         }
@@ -829,8 +930,6 @@ async fn run_engine(
         http,
         cfg,
         workers,
-        worker_kinds,
-        worker_enabled,
         worker_cmds,
         worker_progress,
         internal_rx,

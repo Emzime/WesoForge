@@ -1,8 +1,11 @@
 [workspace]
 members = [
   "crates/client",
+  "crates/client-affinity",
+  "crates/client-compute",
   "crates/client-core",
   "crates/client-engine",
+  "crates/client-gpu",
   "crates/client-gui",
   "crates/chiavdf-fast",
 ]
@@ -14,7 +17,7 @@ strip = false
 
 [workspace.package]
 edition = "2024"
-version = "1.0.0"
+version = "1.1.0"
 
 [workspace.lints.rust]
 unused_crate_dependencies = "deny"
@@ -32,3 +35,4 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 indicatif = "0.18.3"
 crossterm = "0.29.0"
 libc = "0.2.180"
+libloading = "0.8.9"

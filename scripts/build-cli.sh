@@ -4,6 +4,131 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+prereq_banner() {
+  echo "" >&2
+  echo "=== Prérequis: build CLI WesoForge ===" >&2
+  echo "Composants requis :" >&2
+  echo "  - Rust toolchain (rustup + cargo)" >&2
+  echo "  - Git (recommandé)" >&2
+  echo "" >&2
+  echo "Si vous l'autorisez, le script tente d'installer automatiquement les composants manquants." >&2
+  echo "Forcer le comportement via: BBR_PREREQ_AUTO=1 (installer) ou BBR_PREREQ_AUTO=0 (ne pas installer)." >&2
+  echo "" >&2
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+pkg_mgr() {
+  if have_cmd apt-get; then echo "apt"; return; fi
+  if have_cmd dnf; then echo "dnf"; return; fi
+  if have_cmd yum; then echo "yum"; return; fi
+  if have_cmd pacman; then echo "pacman"; return; fi
+  if have_cmd zypper; then echo "zypper"; return; fi
+  if have_cmd brew; then echo "brew"; return; fi
+  echo ""
+}
+
+ask_consent() {
+  local missing=($@)
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  if [[ -n "${BBR_PREREQ_AUTO:-}" ]]; then
+    case "${BBR_PREREQ_AUTO,,}" in
+      1|true|yes|y) return 0 ;;
+      0|false|no|n) return 1 ;;
+    esac
+  fi
+
+  echo "Composants manquants :" >&2
+  for m in "${missing[@]}"; do
+    echo "  - $m" >&2
+  done
+  echo "" >&2
+  read -r -p "Autoriser l'installation automatique de TOUS les composants manquants ? (y/N) " ans
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+install_rustup() {
+  local pm="$1"
+  if have_cmd rustup && have_cmd cargo && have_cmd rustc; then return 0; fi
+  case "$pm" in
+    apt)
+      sudo apt-get update
+      sudo apt-get install -y curl ca-certificates build-essential pkg-config
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      ;;
+    dnf|yum)
+      sudo "$pm" install -y curl ca-certificates gcc gcc-c++ make pkgconfig
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      ;;
+    pacman)
+      sudo pacman -Sy --noconfirm curl ca-certificates base-devel pkgconf
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      ;;
+    zypper)
+      sudo zypper refresh
+      sudo zypper install -y curl ca-certificates gcc gcc-c++ make pkg-config
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      ;;
+    brew)
+      brew install rustup-init
+      rustup-init -y
+      ;;
+    *)
+      echo "error: impossible d'installer rustup automatiquement (gestionnaire de paquets inconnu)." >&2
+      return 1
+      ;;
+  esac
+  if [[ -d "$HOME/.cargo/bin" ]]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+}
+
+install_git() {
+  local pm="$1"
+  if have_cmd git; then return 0; fi
+  case "$pm" in
+    apt) sudo apt-get update && sudo apt-get install -y git ;;
+    dnf|yum) sudo "$pm" install -y git ;;
+    pacman) sudo pacman -Sy --noconfirm git ;;
+    zypper) sudo zypper install -y git ;;
+    brew) brew install git ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_prereqs_cli() {
+  prereq_banner
+  local pm
+  pm="$(pkg_mgr)"
+
+  local missing=()
+  (have_cmd cargo && have_cmd rustc) || missing+=("Rust toolchain")
+  have_cmd git || missing+=("Git")
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ -z "$pm" ]]; then
+    echo "error: aucun gestionnaire de paquets détecté (apt/dnf/yum/pacman/zypper/brew)." >&2
+    echo "Installez les prérequis manuellement puis relancez ce script." >&2
+    return 1
+  fi
+
+  if ! ask_consent "${missing[@]}"; then
+    echo "error: prérequis manquants et installation automatique non autorisée." >&2
+    return 1
+  fi
+
+  install_git "$pm" || true
+  install_rustup "$pm"
+}
+
+ensure_prereqs_cli
+
 DIST_DIR="${DIST_DIR:-$ROOT/dist}"
 mkdir -p "$DIST_DIR"
 

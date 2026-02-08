@@ -1,0 +1,19 @@
+[package]
+name = "bbr-client-compute"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Enable CUDA probing/usage via `bbr-client-gpu`.
+cuda = ["bbr-client-gpu/cuda"]
+# Enable OpenCL probing/usage via `bbr-client-gpu`.
+opencl = ["bbr-client-gpu/opencl"]
+# Convenience umbrella feature.
+gpu = ["cuda", "opencl"]
+
+[dependencies]
+anyhow = { workspace = true }
+
+bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
+bbr-client-core = { path = "../client-core" }
+bbr-client-gpu = { path = "../client-gpu", default-features = false }

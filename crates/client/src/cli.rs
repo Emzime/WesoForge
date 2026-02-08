@@ -1,24 +1,7 @@
-use clap::Parser;
-use clap::ValueEnum;
+use clap::{Parser, ValueEnum};
 use reqwest::Url;
 
-fn parse_csv_list(input: &str) -> Result<Vec<String>, String> {
-    let items = input
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    Ok(items)
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum GpuModeCli {
-    Off,
-    Auto,
-    Cuda,
-    Opencl,
-}
+use bbr_client_engine::PinMode;
 
 #[cfg(feature = "prod-backend")]
 const DEFAULT_BACKEND_URL: &str = "https://weso.forgeros.fr/";
@@ -30,7 +13,7 @@ fn default_backend_url() -> Url {
     Url::parse(DEFAULT_BACKEND_URL).expect("DEFAULT_BACKEND_URL must be a valid URL")
 }
 
-pub fn default_parallel_proofs() -> u16 {
+pub fn default_parallel_workers() -> u16 {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -77,36 +60,67 @@ fn parse_mem_budget_bytes(input: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("mem budget too large: {input:?}"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WorkMode {
+    /// Fetch and compute individual proofs.
+    Proof,
+    /// Fetch and compute grouped proofs (shared squaring, default).
+    Group,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PinArg {
+    /// Do not pin worker compute threads (default).
+    Off,
+    /// Pin worker compute threads to shared L3 cache CPU sets (Linux best-effort).
+    L3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ComputeBackendArg {
+    /// Force CPU compute.
+    Cpu,
+    /// Force GPU compute (falls back to CPU if unavailable or failing).
+    Gpu,
+    /// Prefer GPU when available, otherwise CPU (default).
+    Auto,
+}
+
+impl From<PinArg> for PinMode {
+    fn from(value: PinArg) -> Self {
+        match value {
+            PinArg::Off => PinMode::Off,
+            PinArg::L3 => PinMode::L3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(name = "wesoforge", version, about = "WesoForge compact proof worker")]
 pub struct Cli {
     #[arg(long, env = "BBR_BACKEND_URL", default_value_t = default_backend_url())]
     pub backend_url: Url,
 
-    /// Number of CPU proof workers to run in parallel.
-    ///
-    /// Use 0 to disable CPU workers entirely (GPU-only run).
-    #[arg(
-        long = "cpu-workers",
-        env = "BBR_CPU_WORKERS",
-        default_value_t = default_parallel_proofs(),
-        value_parser = clap::value_parser!(u16).range(0..=512)
-    )]
-    pub cpu_workers: u16,
-
-    /// Backward-compatible alias for cpu workers.
-    ///
-    /// If provided, it overrides --cpu-workers.
+    /// Number of workers to run in parallel.
     #[arg(
         short = 'p',
         long,
-        env = "BBR_PARALLEL_PROOFS",
-        value_parser = clap::value_parser!(u16).range(0..=512)
+        env = "BBR_PARALLEL",
+        default_value_t = default_parallel_workers(),
+        value_parser = clap::value_parser!(u16).range(1..=512)
     )]
-    pub parallel: Option<u16>,
+    pub parallel: u16,
+
+    /// Work mode: individual proofs or grouped proofs.
+    #[arg(long, env = "BBR_MODE", value_enum, default_value_t = WorkMode::Group)]
+    pub mode: WorkMode,
 
     #[arg(long, env = "BBR_NO_TUI", default_value_t = false)]
     pub no_tui: bool,
+
+    /// CPU pinning strategy (Linux only; ignored on other platforms).
+    #[arg(long, env = "BBR_PIN", value_enum, default_value_t = PinArg::Off)]
+    pub pin: PinArg,
 
     /// Memory budget per worker for streaming proof generation (e.g. `128MB`).
     ///
@@ -120,38 +134,57 @@ pub struct Cli {
     )]
     pub mem_budget_bytes: u64,
 
-    /// GPU worker mode.
-    #[arg(long, env = "WESOFORGE_GPU_MODE", value_enum, default_value_t = GpuModeCli::Off)]
-    pub gpu_mode: GpuModeCli,
-
-    /// GPU workers per detected device.
+    /// Compute backend selection.
+    ///
+    /// - `auto` (default): use GPU when available, otherwise CPU
+    /// - `gpu`: request GPU compute (falls back to CPU on failure)
+    /// - `cpu`: force CPU compute
     #[arg(
-        long,
-        env = "WESOFORGE_GPU_WORKERS_PER_DEVICE",
-        default_value_t = 1,
-        value_parser = clap::value_parser!(u16).range(1..=64)
+        long = "compute",
+        env = "BBR_COMPUTE_BACKEND",
+        value_enum,
+        default_value_t = ComputeBackendArg::Auto
     )]
-    pub gpu_workers_per_device: u16,
+    pub compute_backend: ComputeBackendArg,
 
-    /// Comma-separated allow list of GPU device keys (e.g. `cuda:0,opencl:1`). If set, only these devices are used.
-    #[arg(long, env = "WESOFORGE_GPU_ALLOW", value_parser = parse_csv_list)]
-    pub gpu_allow: Option<Vec<String>>,
+    /// GPU devices selection.
+    ///
+    /// Accepted values:
+    /// - `all` (default): use all detected GPUs
+    /// - `none`: disable GPU usage (forces CPU)
+    /// - comma-separated list of ordinals, e.g. `0,2,3`
+    ///
+    /// This is backend-specific:
+    /// - CUDA: device ordinals map to `CUdevice` indices
+    /// - OpenCL: maps to flattened OpenCL device indices (across all platforms)
+    #[arg(long = "gpu-devices", env = "BBR_GPU_DEVICES")]
+    pub gpu_devices: Option<String>,
 
-    /// Comma-separated deny list of GPU device keys.
-    #[arg(long, env = "WESOFORGE_GPU_DENY", value_parser = parse_csv_list)]
-    pub gpu_deny: Option<Vec<String>>,
+    /// GPU device index (legacy single-device selection).
+    ///
+    /// Prefer using `--gpu-devices` instead.
+    #[arg(long = "gpu-device", env = "BBR_GPU_DEVICE")]
+    pub gpu_device: Option<u32>,
 
-    /// Comma-separated list of device keys that should start disabled.
-    #[arg(long, env = "WESOFORGE_GPU_START_DISABLED", value_parser = parse_csv_list)]
-    pub gpu_start_disabled: Option<Vec<String>>,
+    /// Number of GPU streams/queues to use (backend-specific).
+    #[arg(long = "gpu-streams", env = "BBR_GPU_STREAMS")]
+    pub gpu_streams: Option<u32>,
 
-    /// Run a local benchmark (e.g. `--bench 0`) and exit.
-    #[arg(long, value_name = "ALGO")]
-    pub bench: Option<u32>,
-}
+    /// GPU batch size (how many jobs to pack per GPU launch).
+    #[arg(long = "gpu-batch-size", env = "BBR_GPU_BATCH_SIZE")]
+    pub gpu_batch_size: Option<u32>,
 
-impl Cli {
-    pub fn effective_cpu_workers(&self) -> u16 {
-        self.parallel.unwrap_or(self.cpu_workers)
-    }
+    /// GPU memory budget (e.g. `1024MB`).
+    #[arg(long = "gpu-mem", env = "BBR_GPU_MEM_BUDGET", value_parser = parse_mem_budget_bytes)]
+    pub gpu_mem_budget_bytes: Option<u64>,
+
+    /// List detected GPU devices (CUDA/OpenCL) and exit.
+    #[arg(long = "list-gpus")]
+    pub list_gpus: bool,
+
+    /// Run a local benchmark and exit.
+    ///
+    /// Uses current `--mode` and `--parallel` settings.
+    #[arg(long)]
+    pub bench: bool,
 }

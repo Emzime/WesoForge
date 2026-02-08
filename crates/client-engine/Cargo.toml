@@ -3,6 +3,14 @@ name = "bbr-client-engine"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Enable CUDA probing/usage through the compute facade.
+cuda = ["bbr-client-compute/cuda"]
+# Enable OpenCL probing/usage through the compute facade.
+opencl = ["bbr-client-compute/opencl"]
+# Convenience umbrella feature.
+gpu = ["cuda", "opencl"]
+
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -13,18 +21,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
+bbr-client-affinity = { path = "../client-affinity" }
 bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
+bbr-client-compute = { path = "../client-compute" }
 bbr-client-core = { path = "../client-core" }
-
-# Optional GPU backend crate (CUDA / OpenCL live there)
-bbr-client-gpu = { path = "../client-gpu", optional = true, default-features = false }
-
-[features]
-default = []
-
-# Forward GPU features to the GPU crate
-cuda = ["dep:bbr-client-gpu", "bbr-client-gpu/cuda"]
-opencl = ["dep:bbr-client-gpu", "bbr-client-gpu/opencl"]
-
-# Convenience meta-feature
-gpu = ["cuda", "opencl"]

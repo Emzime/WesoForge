@@ -116,6 +116,31 @@ pub(crate) struct BackendWorkBatch {
     pub(crate) jobs: Vec<BackendJobDto>,
 }
 
+#[derive(Debug, Serialize)]
+struct LeaseBatchRequest {
+    count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeaseGroupsResponse {
+    lease_id: String,
+    lease_expires_at: i64,
+    groups: Vec<LeasedGroupDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeasedGroupDto {
+    jobs: Vec<BackendJobDto>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendWorkGroup {
+    pub(crate) group_id: u64,
+    pub(crate) lease_id: String,
+    pub(crate) lease_expires_at: i64,
+    pub(crate) jobs: Vec<BackendJobDto>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct BackendJobDto {
     pub(crate) job_id: u64,
@@ -158,6 +183,45 @@ pub(crate) async fn fetch_work(
         return Err(error_from_response(res).await);
     }
     Ok(res.json().await?)
+}
+
+pub(crate) async fn fetch_batch_work(
+    http: &reqwest::Client,
+    backend: &Url,
+    count: u32,
+) -> anyhow::Result<Vec<BackendWorkGroup>> {
+    let count = count.clamp(1, 32);
+    let url = backend.join("api/jobs/lease_batch")?;
+    let res = http
+        .post(url)
+        .json(&LeaseBatchRequest { count: Some(count) })
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        return Err(error_from_response(res).await);
+    }
+
+    let batch: LeaseGroupsResponse = res.json().await?;
+    if batch.groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(batch.groups.len());
+    for group in batch.groups {
+        if group.jobs.is_empty() {
+            continue;
+        }
+        let group_id = group.jobs[0].job_id;
+        out.push(BackendWorkGroup {
+            group_id,
+            lease_id: batch.lease_id.clone(),
+            lease_expires_at: batch.lease_expires_at,
+            jobs: group.jobs,
+        });
+    }
+
+    Ok(out)
 }
 
 pub(crate) async fn submit_job(

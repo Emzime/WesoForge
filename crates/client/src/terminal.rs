@@ -54,7 +54,8 @@ impl TuiTerminal {
                     continue;
                 };
                 if let Event::Key(key) = ev {
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         let n = shutdown.bump_forced();
                         if n == 1 {

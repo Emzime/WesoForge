@@ -1,214 +1,184 @@
-#![deny(missing_docs)]
-#![deny(unreachable_pub)]
-
-//! GPU support crate (CUDA / OpenCL) for WesoForge.
+//! GPU backend facade.
 //!
-//! Phase 1 (CUDA): real CUDA execution plumbing (kernel launch) is implemented as a validation step.
-//! The VDF prover math still runs on CPU for correctness.
+//! This crate is intentionally isolated from the CPU engine. The CPU engine should only
+//! depend on `bbr-client-compute`, which may delegate to this crate for GPU selection.
 
-mod detect;
-mod error;
+pub mod auto;
+
+/// GPU execution entrypoints.
+///
+/// This module intentionally contains only GPU-side logic. The CPU engine should remain
+/// separate and only call into this crate via `bbr-client-compute`.
+pub mod execute;
 
 #[cfg(feature = "cuda")]
-mod cuda;
+pub mod cuda;
 
 #[cfg(feature = "opencl")]
-mod opencl;
+pub mod opencl;
 
-pub use detect::{detect_devices, GpuApi, GpuDevice};
-pub use error::{ClientGpuError, GpuPreference};
-
-fn log_backend(msg: &str) {
-    eprintln!("[client-gpu] {msg}");
+/// GPU backend kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBackend {
+    /// NVIDIA CUDA (driver API).
+    Cuda,
+    /// OpenCL (AMD/Intel/NVIDIA).
+    OpenCl,
 }
 
-/// Auto-select GPU backend (CUDA/OpenCL) and run the chiavdf prover.
-pub fn prove_one_weso_fast_streaming_auto(
-    preference: GpuPreference,
-    challenge_hash: &[u8],
-    x_s: &[u8],
-    y_ref_s: &[u8],
-    discriminant_size_bits: usize,
-    num_iterations: u64,
-) -> Result<Vec<u8>, ClientGpuError> {
-    let pref = preference.resolve_from_env();
-
-    if pref.allows(GpuApi::Cuda) {
-        #[cfg(feature = "cuda")]
-        {
-            if let Ok(true) = cuda::is_available() {
-                log_backend("CUDA available; running phase-1 kernel (plumbing validation)");
-                let _ctx = cuda::CudaContext::new().map_err(ClientGpuError::CudaInit)?;
-                cuda::run_spin_kernel(num_iterations).map_err(ClientGpuError::CudaInit)?;
-            } else {
-                log_backend("CUDA requested but not available; using CPU");
-            }
-        }
-    }
-
-    if pref.allows(GpuApi::OpenCl) {
-        #[cfg(feature = "opencl")]
-        {
-            if let Ok(true) = opencl::is_available() {
-                log_backend("OpenCL available; (compute path not implemented yet), using CPU");
-                let _ctx = opencl::OpenClContext::new().map_err(ClientGpuError::OpenClInit)?;
-            }
-        }
-    }
-
-    log_backend("CPU prover (source of truth) running");
-    bbr_client_chiavdf_fast::prove_one_weso_fast_streaming(
-        challenge_hash,
-        x_s,
-        y_ref_s,
-        discriminant_size_bits,
-        num_iterations,
-    )
-    .map_err(ClientGpuError::CpuFallback)
+/// Result of a GPU probe.
+#[derive(Debug, Clone)]
+pub struct GpuProbe {
+    /// Whether the backend appears usable.
+    pub available: bool,
+    /// Optional detail message.
+    pub detail: Option<String>,
 }
 
-/// Auto-select GPU backend with progress callback.
-pub fn prove_one_weso_fast_streaming_auto_with_progress<F>(
-    preference: GpuPreference,
-    challenge_hash: &[u8],
-    x_s: &[u8],
-    y_ref_s: &[u8],
-    discriminant_size_bits: usize,
-    num_iterations: u64,
-    progress_interval: u64,
-    mut on_progress: F,
-) -> Result<Vec<u8>, ClientGpuError>
-where
-    F: FnMut(u64) + Send + 'static,
-{
-    let pref = preference.resolve_from_env();
-
-    if pref.allows(GpuApi::Cuda) {
-        #[cfg(feature = "cuda")]
-        {
-            if let Ok(true) = cuda::is_available() {
-                log_backend("CUDA available; running phase-1 kernel (plumbing validation) [with progress]");
-                let _ctx = cuda::CudaContext::new().map_err(ClientGpuError::CudaInit)?;
-                cuda::run_spin_kernel(num_iterations).map_err(ClientGpuError::CudaInit)?;
-            } else {
-                log_backend("CUDA requested but not available [with progress]; using CPU");
-            }
+impl GpuProbe {
+    /// Convenience constructor for an unavailable backend.
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            detail: Some(detail.into()),
         }
     }
 
-    if pref.allows(GpuApi::OpenCl) {
-        #[cfg(feature = "opencl")]
-        {
-            if let Ok(true) = opencl::is_available() {
-                log_backend("OpenCL available; (compute path not implemented yet) [with progress], using CPU");
-                let _ctx = opencl::OpenClContext::new().map_err(ClientGpuError::OpenClInit)?;
-            }
+    /// Convenience constructor for an available backend.
+    pub fn available(detail: Option<String>) -> Self {
+        Self {
+            available: true,
+            detail,
         }
     }
-
-    log_backend("CPU prover (source of truth) running [with progress]");
-    bbr_client_chiavdf_fast::prove_one_weso_fast_streaming_with_progress(
-        challenge_hash,
-        x_s,
-        y_ref_s,
-        discriminant_size_bits,
-        num_iterations,
-        progress_interval,
-        move |iters_done| on_progress(iters_done),
-    )
-    .map_err(ClientGpuError::CpuFallback)
 }
 
-/// Run the prover while targeting a specific GPU device (by API + index).
-///
-/// Today this still runs the prover math on CPU for correctness, but it performs
-/// a device-specific phase-1 kernel/initialization step for plumbing validation.
-pub fn prove_one_weso_fast_streaming_on_device(
-    api: GpuApi,
-    device_index: usize,
-    challenge_hash: &[u8],
-    x_s: &[u8],
-    y_ref_s: &[u8],
-    discriminant_size_bits: usize,
-    num_iterations: u64,
-) -> Result<Vec<u8>, ClientGpuError> {
-    match api {
-        GpuApi::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                log_backend(&format!("CUDA device {device_index}; running phase-1 kernel (plumbing validation)"));
-                cuda::run_spin_kernel_on_device(device_index, num_iterations)
-                    .map_err(ClientGpuError::CudaInit)?;
-            }
-        }
-        GpuApi::OpenCl => {
-            #[cfg(feature = "opencl")]
-            {
-                log_backend(&format!("OpenCL device {device_index}; running phase-1 validation"));
-                opencl::run_spin_kernel_on_device(device_index, num_iterations)
-                    .map_err(ClientGpuError::OpenClInit)?;
-            }
-        }
-    }
-
-    log_backend("CPU prover (source of truth) running");
-    bbr_client_chiavdf_fast::prove_one_weso_fast_streaming(
-        challenge_hash,
-        x_s,
-        y_ref_s,
-        discriminant_size_bits,
-        num_iterations,
-    )
-    .map_err(ClientGpuError::CpuFallback)
+/// GPU device selection policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuDeviceSelection {
+    /// Use all usable devices detected by the backend.
+    All,
+    /// Disable GPU usage entirely.
+    None,
+    /// Use a specific list of device ordinals.
+    List(Vec<u32>),
 }
 
-/// Same as `prove_one_weso_fast_streaming_on_device` but with progress callback.
-pub fn prove_one_weso_fast_streaming_on_device_with_progress<F>(
-    api: GpuApi,
-    device_index: usize,
-    challenge_hash: &[u8],
-    x_s: &[u8],
-    y_ref_s: &[u8],
-    discriminant_size_bits: usize,
-    num_iterations: u64,
-    progress_interval: u64,
-    mut on_progress: F,
-) -> Result<Vec<u8>, ClientGpuError>
-where
-    F: FnMut(u64) + Send + 'static,
-{
-    match api {
-        GpuApi::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                log_backend(&format!(
-                    "CUDA device {device_index}; running phase-1 kernel (plumbing validation) [with progress]"
-                ));
-                cuda::run_spin_kernel_on_device(device_index, num_iterations)
-                    .map_err(ClientGpuError::CudaInit)?;
+impl GpuDeviceSelection {
+    /// Parse a device selection string.
+    ///
+    /// Accepted values:
+    /// - `all`
+    /// - `none`
+    /// - comma-separated list of integers, e.g. `0,2,3`
+    pub fn parse(input: &str) -> Option<Self> {
+        let s = input.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let lower = s.to_ascii_lowercase();
+        if lower == "all" {
+            return Some(Self::All);
+        }
+        if lower == "none" {
+            return Some(Self::None);
+        }
+
+        let mut out: Vec<u32> = Vec::new();
+        for part in s.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            let v: u32 = p.parse().ok()?;
+            if !out.contains(&v) {
+                out.push(v);
             }
         }
-        GpuApi::OpenCl => {
-            #[cfg(feature = "opencl")]
-            {
-                log_backend(&format!(
-                    "OpenCL device {device_index}; running phase-1 validation [with progress]"
-                ));
-                opencl::run_spin_kernel_on_device(device_index, num_iterations)
-                    .map_err(ClientGpuError::OpenClInit)?;
-            }
+        if out.is_empty() {
+            None
+        } else {
+            Some(Self::List(out))
         }
     }
 
-    log_backend("CPU prover (source of truth) running [with progress]");
-    bbr_client_chiavdf_fast::prove_one_weso_fast_streaming_with_progress(
-        challenge_hash,
-        x_s,
-        y_ref_s,
-        discriminant_size_bits,
-        num_iterations,
-        progress_interval,
-        move |iters_done| on_progress(iters_done),
-    )
-    .map_err(ClientGpuError::CpuFallback)
+    pub fn matches(&self, index: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::List(list) => list.contains(&index),
+        }
+    }
+
+    /// Render selection to a compact string form.
+    pub fn to_env_string(&self) -> String {
+        match self {
+            Self::All => "all".to_string(),
+            Self::None => "none".to_string(),
+            Self::List(list) => list.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+        }
+    }
+}
+
+/// GPU runtime configuration (read from env or CLI).
+#[derive(Debug, Clone)]
+pub struct GpuConfig {
+    pub devices: GpuDeviceSelection,
+    pub streams: Option<u32>,
+    pub batch_size: Option<u32>,
+    pub mem_budget_bytes: Option<u64>,
+}
+
+impl Default for GpuConfig {
+    fn default() -> Self {
+        Self {
+            devices: GpuDeviceSelection::All,
+            streams: None,
+            batch_size: None,
+            mem_budget_bytes: None,
+        }
+    }
+}
+
+impl GpuConfig {
+    /// Read GPU configuration from environment variables.
+    ///
+    /// Environment variables:
+    /// - `BBR_GPU_DEVICES` (`all`, `none`, or `0,2,3`)
+    /// - `BBR_GPU_DEVICE` (legacy single device; used only if `BBR_GPU_DEVICES` is not set)
+    /// - `BBR_GPU_STREAMS`
+    /// - `BBR_GPU_BATCH_SIZE`
+    /// - `BBR_GPU_MEM_BUDGET` (bytes)
+    pub fn from_env() -> Self {
+        let devices = if let Ok(v) = std::env::var("BBR_GPU_DEVICES") {
+            GpuDeviceSelection::parse(&v).unwrap_or(GpuDeviceSelection::All)
+        } else if let Ok(v) = std::env::var("BBR_GPU_DEVICE") {
+            match v.trim().parse::<u32>() {
+                Ok(idx) => GpuDeviceSelection::List(vec![idx]),
+                Err(_) => GpuDeviceSelection::All,
+            }
+        } else {
+            GpuDeviceSelection::All
+        };
+
+        Self {
+            devices,
+            streams: parse_env_u32("BBR_GPU_STREAMS"),
+            batch_size: parse_env_u32("BBR_GPU_BATCH_SIZE"),
+            mem_budget_bytes: parse_env_u64("BBR_GPU_MEM_BUDGET"),
+        }
+    }
+
+    /// Returns true if GPU usage is disabled by configuration.
+    pub fn is_disabled(&self) -> bool {
+        matches!(self.devices, GpuDeviceSelection::None)
+    }
+}
+
+fn parse_env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+fn parse_env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok())
 }

@@ -21,11 +21,13 @@ bbr-client-chiavdf-fast = { path = "../chiavdf-fast" }
 bbr-client-core = { path = "../client-core" }
 bbr-client-engine = { path = "../client-engine" }
 
+bbr-client-gpu = { path = "../client-gpu" }
+
 [features]
 # Use the production backend URL as the compiled default for `--backend-url`.
 prod-backend = []
 
-# Forward GPU features to the engine crate only (engine forwards to client-gpu).
-cuda = ["bbr-client-engine/cuda"]
-opencl = ["bbr-client-engine/opencl"]
-gpu = ["bbr-client-engine/gpu"]
+# GPU backends (optional)
+cuda = ["bbr-client-gpu/cuda"]
+opencl = ["bbr-client-gpu/opencl"]
+gpu = ["cuda", "opencl"]

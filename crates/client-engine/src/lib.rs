@@ -10,9 +10,10 @@ pub mod api;
 mod backend;
 mod engine;
 mod inflight;
+mod pinning;
 mod worker;
 
 pub use api::{
-    start_engine, EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary,
-    GpuConfig, GpuMode, StatusSnapshot, WorkerKind, WorkerSnapshot, WorkerStage,
+    EngineConfig, EngineEvent, EngineHandle, JobOutcome, JobSummary, PinMode, StatusSnapshot,
+    WorkerSnapshot, WorkerStage, start_engine,
 };

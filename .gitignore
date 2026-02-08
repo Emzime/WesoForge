@@ -6,6 +6,3 @@ dist/
 ui/node_modules/
 ui/dist/
 
-crates/client-engine/test.log
-*.log
-chiavdf/
